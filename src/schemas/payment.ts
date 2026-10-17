@@ -13,6 +13,7 @@ export const PaymentInputSchema = z
       .regex(/^\d{4}-\d{2}$/, "รอบบิลต้องอยู่ในรูปแบบ YYYY-MM เช่น 2026-10")
       .optional(),
     note: z.string().trim().optional().default(""),
+    idempotency_key: z.string().trim().min(1).max(256).optional(),
   })
   .refine(
     (data) => {
