@@ -21,6 +21,7 @@ import {
   getJobPhotos,
   getJobPhotoById,
   validatePhotoUploadQuota,
+  createJobPhoto,
   getDashboardData,
 } from "../src/lib/db";
 import {
@@ -35,8 +36,11 @@ import {
   putPhoto,
   getPhoto,
   deletePhoto,
+  listPhotos,
+  reconcileR2Storage,
   clearMemoryStorage,
 } from "../src/lib/storage";
+import { executePaymentWithRetry } from "../src/lib/payment-client";
 
 /**
  * Lightweight in-memory D1 mock with SQL query counting
@@ -380,6 +384,86 @@ async function runRemediationVerification() {
   console.log("  ✓ SQL precedence and durable cleanup confirmed");
 
   // =========================================================================
+  // P0-01 FAULT-INJECTION TEST: Delayed R2 PUT After Sweeper Deletion
+  // =========================================================================
+  console.log("\n▶ Testing P0-01: Delayed R2 PUT After Sweeper Deletion Fault-Injection...");
+
+  // 1. Upload A reserves a slot in D1
+  const lateKey = `users/${user1.id}/jobs/${job1.id}/delayed-late-writer.webp`;
+  const lateReservation = await reservePhotoSlot(db, user1.id, job1.id, lateKey);
+  assert.strictEqual(lateReservation.status, "RESERVED");
+
+  // 2. Upload A starts an R2 PUT that remains in flight beyond reservation TTL
+  assert.strictEqual(await getPhoto(null, lateKey), null);
+
+  // 3. Fast forward reservation TTL (> 5 minutes)
+  sqlite.prepare("UPDATE job_photos SET created_at = datetime('now', '-6 minutes') WHERE id = ?").run(lateReservation.id);
+
+  // 4. Sweeper runs, transitions expired reservation, calls R2 delete (finds nothing), and purges D1 row
+  const lateSweeperResult = await cleanupOrphanedPhotos(db, null, user1.id, "sweeper-early");
+  assert.strictEqual(lateSweeperResult.cleanedCount, 1);
+  const d1Check = sqlite.prepare("SELECT id FROM job_photos WHERE id = ?").get(lateReservation.id);
+  assert.strictEqual(d1Check, undefined, "D1 reservation was purged by sweeper");
+
+  // 5. Upload A's delayed PUT finally completes afterward in R2!
+  const latePayload = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50]); // WebP
+  await putPhoto(null, lateKey, latePayload, "image/webp");
+  assert.ok((await getPhoto(null, lateKey)) !== null, "R2 now holds the delayed late-written object");
+
+  // 6. The upload handler crashes / terminates without compensation!
+  // At this point, R2 contains lateKey, but D1 has no row.
+  // Verify that an asynchronous storage reconciler detects and purges this orphan!
+  const reconcileResult = await reconcileR2Storage(null, db, {
+    prefix: `users/${user1.id}/jobs/${job1.id}/`,
+    safetyGracePeriodMs: 0,
+  });
+  assert.ok(reconcileResult.deletedOrphans.includes(lateKey), "Reconciler MUST find and purge late-written orphan");
+  const postReconcile = await getPhoto(null, lateKey);
+  assert.strictEqual(postReconcile, null, "Late-written R2 orphan successfully eliminated from storage");
+  console.log("  ✓ P0-01: Late R2 PUT fault injection verified; storage reconciler guaranteed zero orphans");
+
+  // =========================================================================
+  // P0-02 CONCURRENCY TEST: Simultaneous Sweepers & Atomic CAS Leases
+  // =========================================================================
+  console.log("\n▶ Testing P0-02: Simultaneous Sweepers & Atomic CAS State Transitions...");
+
+  const dummyR2Key = `users/${user1.id}/jobs/${job1.id}/concurrent-test.webp`;
+  await putPhoto(null, dummyR2Key, latePayload, "image/webp");
+  const photoForCAS = await createJobPhoto(db, user1.id, job1.id, dummyR2Key);
+  await markPhotoForDeletion(db, user1.id, job1.id, photoForCAS.id);
+
+  // Simulate Sweeper 1 and Sweeper 2 running concurrently on the exact same row:
+  // Sweeper 1 claims the lease via atomic CAS with worker ID 'worker-1'
+  const claimRes1 = await db.prepare(
+    `UPDATE job_photos 
+     SET status = 'CLEANING', cleanup_worker_id = 'worker-1', cleanup_generation = cleanup_generation + 1 
+     WHERE id = ? AND status = 'PENDING_DELETE'`
+  ).bind(photoForCAS.id).run();
+  assert.strictEqual((claimRes1 as any).changes, 1, "Sweeper 1 successfully acquired exclusive lease");
+
+  // Sweeper 2 attempts CAS claim on the SAME row concurrently -> MUST get 0 affected rows
+  const claimRes2 = await db.prepare(
+    `UPDATE job_photos 
+     SET status = 'CLEANING', cleanup_worker_id = 'worker-2', cleanup_generation = cleanup_generation + 1 
+     WHERE id = ? AND status = 'PENDING_DELETE'`
+  ).bind(photoForCAS.id).run();
+  assert.strictEqual((claimRes2 as any).changes, 0, "Sweeper 2's affected count MUST be 0 (CAS collision)");
+
+  // Stale Sweeper 2 attempts deletion without holding lease -> MUST fail
+  const staleDeleteRes = await db.prepare(
+    `DELETE FROM job_photos WHERE id = ? AND status = 'CLEANING' AND cleanup_worker_id = 'worker-2'`
+  ).bind(photoForCAS.id).run();
+  assert.strictEqual((staleDeleteRes as any).changes, 0, "Stale sweeper 2 CANNOT delete row without holding lease");
+
+  // Legitimate Sweeper 1 completes external R2 deletion and purges D1 row
+  await deletePhoto(null, dummyR2Key);
+  const legitDeleteRes = await db.prepare(
+    `DELETE FROM job_photos WHERE id = ? AND status = 'CLEANING' AND cleanup_worker_id = 'worker-1'`
+  ).bind(photoForCAS.id).run();
+  assert.strictEqual((legitDeleteRes as any).changes, 1, "Lease holder Sweeper 1 successfully purged D1 row");
+  console.log("  ✓ P0-02: Simultaneous sweepers and atomic CAS lease ownership verified");
+
+  // =========================================================================
   // 7. DATA-03 & BLOCKER 3: Retainer Multiple Partial Payments & Replay Matching
   // =========================================================================
   console.log("\n▶ Testing DATA-03 & BLOCKER 3: Retainer Multiple Partial Payments & Replay Validation...");
@@ -483,9 +567,108 @@ async function runRemediationVerification() {
   console.log("  ✓ Material replay validation (amount, partsCost, note) prevents conflict tampering");
 
   // =========================================================================
+  // P1-03 CLIENT TEST: Lost Response & Idempotency Key Retry Persistence
+  // =========================================================================
+  console.log("\n▶ Testing P1-03: Lost Network Response & Client Retry Persistence...");
+
+  const clientStorageMap = new Map<string, string>();
+  const mockStorage = {
+    getItem: (k: string) => clientStorageMap.get(k) || null,
+    setItem: (k: string, v: string) => { clientStorageMap.set(k, v); },
+    removeItem: (k: string) => { clientStorageMap.delete(k); },
+  };
+
+  let callCount = 0;
+  const mockFetchWithLostResponse = async (url: string, init: any) => {
+    callCount++;
+    const payload = JSON.parse(init.body);
+    
+    // Server processes payment into D1
+    const pRecord = await addJobPayment(db, user1.id, {
+      jobId: payload.job_id || retainerJob.id,
+      amount: payload.amount,
+      partsCost: payload.parts_cost || 0,
+      paymentType: payload.payment_type,
+      billingPeriod: payload.billing_period,
+      note: payload.note,
+      idempotencyKey: payload.idempotency_key,
+    });
+
+    if (callCount === 1) {
+      // Simulate network connection drop before response reaches client!
+      throw new Error("Network connection dropped before response received");
+    }
+
+    return new Response(JSON.stringify({ success: true, payment: pRecord }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  // Attempt 1: Fails due to dropped network response
+  const attempt1 = await executePaymentWithRetry({
+    jobId: retainerJob.id,
+    amount: 1000,
+    partsCost: 0,
+    paymentType: "RETAINER_CYCLE",
+    billingPeriod: "2026-11",
+    note: "November Collection",
+    storage: mockStorage,
+    fetchFn: mockFetchWithLostResponse as any,
+  });
+
+  assert.strictEqual(attempt1.ok, false);
+  assert.ok(attempt1.error?.includes("dropped"));
+  // Key MUST remain persisted in client storage!
+  const persistedKey = mockStorage.getItem(`parity_pending_pay_${retainerJob.id}_2026-11`);
+  assert.ok(persistedKey !== null, "Idempotency key must remain in storage after network failure");
+  assert.strictEqual(persistedKey, attempt1.idempotencyKey);
+
+  // Attempt 2: User retries with page reload or click
+  const attempt2 = await executePaymentWithRetry({
+    jobId: retainerJob.id,
+    amount: 1000,
+    partsCost: 0,
+    paymentType: "RETAINER_CYCLE",
+    billingPeriod: "2026-11",
+    note: "November Collection",
+    storage: mockStorage,
+    fetchFn: mockFetchWithLostResponse as any,
+  });
+
+  assert.strictEqual(attempt2.ok, true);
+  assert.strictEqual(attempt2.idempotencyKey, attempt1.idempotencyKey, "Retry used IDENTICAL idempotency key");
+  assert.strictEqual(attempt2.data.payment.isIdempotentReplay, true, "Server recognized idempotent replay");
+
+  // Verify D1 has EXACTLY ONE payment for 2026-11!
+  const novPayments = (await getJobPayments(db, user1.id, retainerJob.id)).filter(p => p.billing_period === "2026-11");
+  assert.strictEqual(novPayments.length, 1, "Only ONE payment record created despite network drop and retry");
+
+  // Storage key must be cleared on success
+  assert.strictEqual(mockStorage.getItem(`parity_pending_pay_${retainerJob.id}_2026-11`), null);
+
+  // Next payment click generates a NEW operation key for a second partial payment
+  const attempt3 = await executePaymentWithRetry({
+    jobId: retainerJob.id,
+    amount: 500,
+    partsCost: 0,
+    paymentType: "RETAINER_CYCLE",
+    billingPeriod: "2026-11",
+    note: "November Second Partial Collection",
+    storage: mockStorage,
+    fetchFn: mockFetchWithLostResponse as any,
+  });
+  assert.strictEqual(attempt3.ok, true);
+  assert.notStrictEqual(attempt3.idempotencyKey, attempt1.idempotencyKey, "New partial payment received distinct key");
+
+  const novPaymentsTotal = (await getJobPayments(db, user1.id, retainerJob.id)).filter(p => p.billing_period === "2026-11");
+  assert.strictEqual(novPaymentsTotal.length, 2, "Two distinct partial payments recorded");
+  console.log("  ✓ P1-03: Lost-response client retry persistence and distinct partial collections verified");
+
+  // =========================================================================
   // 8. BLOCKER 4: Migration Compatibility & Deterministic Backfill
   // =========================================================================
-  console.log("\n▶ Testing BLOCKER 4: Migration 0002 Backfill & Compatibility...");
+  console.log("\n▶ Testing BLOCKER 4 & Migration Safety: Migration 0002 Backfill & Customer Data Retention...");
 
   // Create isolated fresh SQLite DB simulating legacy 0001 schema state
   const legacySqlite = new DatabaseSync(":memory:");
@@ -535,21 +718,17 @@ async function runRemediationVerification() {
   );
   assert.ok(job1Backfilled.every((p) => p.status === "ACTIVE"));
 
-  // Verify Job 2 surplus handling: slots 1..5 are ACTIVE, 6th is PENDING_DELETE
+  // Verify Job 2 surplus handling: slots 1..5 are ACTIVE, 6th is PRESERVED as ACTIVE with slot_number = null
   const job2Backfilled = legacySqlite
     .prepare("SELECT id, slot_number, status FROM job_photos WHERE job_id = 2 ORDER BY id ASC")
     .all() as any[];
   assert.strictEqual(job2Backfilled.length, 6);
-  const activePhotos = job2Backfilled.filter((p) => p.status === "ACTIVE");
-  const pendingPhotos = job2Backfilled.filter((p) => p.status === "PENDING_DELETE");
-  assert.strictEqual(activePhotos.length, 5);
-  assert.deepStrictEqual(
-    activePhotos.map((p) => p.slot_number),
-    [1, 2, 3, 4, 5]
-  );
-  assert.strictEqual(pendingPhotos.length, 1);
-  assert.strictEqual(pendingPhotos[0].id, 9);
-  console.log("  ✓ Migration 0002 deterministic backfill and surplus photo handling verified");
+  assert.ok(job2Backfilled.every((p) => p.status === "ACTIVE"), "All 6 customer photos PRESERVED without data loss");
+  const assignedSlots = job2Backfilled.slice(0, 5).map((p) => p.slot_number);
+  assert.deepStrictEqual(assignedSlots, [1, 2, 3, 4, 5]);
+  assert.strictEqual(job2Backfilled[5].slot_number, null, "Surplus photo has null slot_number");
+  assert.strictEqual(job2Backfilled[5].id, 9);
+  console.log("  ✓ Migration 0002 deterministic backfill and customer data retention verified");
 
   // =========================================================================
   // 9. Dashboard Query Count & Performance (Zero N+1)

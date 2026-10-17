@@ -66,12 +66,14 @@ CREATE TABLE IF NOT EXISTS job_photos (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  slot_number INTEGER NOT NULL CHECK(slot_number BETWEEN 1 AND 5),
+  slot_number INTEGER CHECK(slot_number BETWEEN 1 AND 5),
   r2_key TEXT NOT NULL,
   caption TEXT,
-  status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('RESERVED', 'ACTIVE', 'PENDING_DELETE', 'FAILED')),
+  status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('RESERVED', 'ACTIVE', 'PENDING_DELETE', 'FAILED', 'CLEANING')),
   cleanup_attempts INTEGER DEFAULT 0,
   last_cleanup_error TEXT,
+  cleanup_worker_id TEXT,
+  cleanup_generation INTEGER DEFAULT 0,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(job_id, slot_number)
 );

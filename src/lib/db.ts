@@ -52,12 +52,14 @@ export interface JobPhotoRecord {
   id: number;
   job_id: number;
   user_id: number;
-  slot_number: number;
+  slot_number?: number | null;
   r2_key: string;
   caption?: string;
-  status: "RESERVED" | "ACTIVE" | "PENDING_DELETE" | "FAILED";
+  status: "RESERVED" | "ACTIVE" | "PENDING_DELETE" | "FAILED" | "CLEANING";
   cleanup_attempts?: number;
   last_cleanup_error?: string;
+  cleanup_worker_id?: string;
+  cleanup_generation?: number;
   created_at: string;
 }
 
@@ -126,12 +128,14 @@ export async function initDatabase(db: D1Database): Promise<void> {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      slot_number INTEGER NOT NULL CHECK(slot_number BETWEEN 1 AND 5),
+      slot_number INTEGER CHECK(slot_number BETWEEN 1 AND 5),
       r2_key TEXT NOT NULL,
       caption TEXT,
-      status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('RESERVED', 'ACTIVE', 'PENDING_DELETE', 'FAILED')),
+      status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('RESERVED', 'ACTIVE', 'PENDING_DELETE', 'FAILED', 'CLEANING')),
       cleanup_attempts INTEGER DEFAULT 0,
       last_cleanup_error TEXT,
+      cleanup_worker_id TEXT,
+      cleanup_generation INTEGER DEFAULT 0,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(job_id, slot_number)
     );
@@ -674,14 +678,21 @@ export async function reservePhotoSlot(
   const existingRows = await db
     .prepare(
       `SELECT id, slot_number, status, created_at FROM job_photos 
-       WHERE job_id = ? AND user_id = ? AND status IN ('ACTIVE', 'RESERVED')`
+       WHERE job_id = ? AND user_id = ? AND status IN ('ACTIVE', 'RESERVED', 'CLEANING')`
     )
     .bind(jobId, userId)
-    .all<{ id: number; slot_number: number; status: string; created_at: string }>();
+    .all<{ id: number; slot_number: number | null; status: string; created_at: string }>();
+
+  const totalCount = existingRows.results?.length ?? 0;
+  if (totalCount >= 5) {
+    throw new Error("อัปโหลดรูปภาพได้สูงสุด 5 รูปต่อใบงาน (Max 5 photos reached)");
+  }
 
   const occupiedSlots = new Set<number>();
   for (const row of existingRows.results || []) {
-    occupiedSlots.add(row.slot_number);
+    if (row.slot_number !== null && row.slot_number !== undefined) {
+      occupiedSlots.add(row.slot_number);
+    }
   }
 
   if (occupiedSlots.size >= 5) {
@@ -718,12 +729,16 @@ export async function reservePhotoSlot(
       const retrySlots = await db
         .prepare(
           `SELECT slot_number FROM job_photos 
-           WHERE job_id = ? AND user_id = ? AND status IN ('ACTIVE', 'RESERVED', 'PENDING_DELETE')`
+           WHERE job_id = ? AND user_id = ? AND status IN ('ACTIVE', 'RESERVED', 'CLEANING')`
         )
         .bind(jobId, userId)
-        .all<{ slot_number: number }>();
-      const currentOccupied = new Set((retrySlots.results || []).map((r) => r.slot_number));
-      if (currentOccupied.size >= 5) {
+        .all<{ slot_number: number | null }>();
+      const currentOccupied = new Set(
+        (retrySlots.results || [])
+          .map((r) => r.slot_number)
+          .filter((s): s is number => s !== null && s !== undefined)
+      );
+      if (currentOccupied.size >= 5 || (retrySlots.results || []).length >= 5) {
         throw new Error("อัปโหลดรูปภาพได้สูงสุด 5 รูปต่อใบงาน (Max 5 photos reached)");
       }
       for (let s = 1; s <= 5; s++) {
@@ -799,7 +814,7 @@ export async function markPhotoForDeletion(
 ): Promise<JobPhotoRecord> {
   const photo = await db
     .prepare(
-      `UPDATE job_photos SET status = 'PENDING_DELETE' 
+      `UPDATE job_photos SET status = 'PENDING_DELETE', slot_number = NULL 
        WHERE id = ? AND job_id = ? AND user_id = ? 
        RETURNING *`
     )
@@ -848,15 +863,23 @@ export async function deleteJobPhoto(
 export async function cleanupOrphanedPhotos(
   db: D1Database,
   r2: any,
-  userId?: number
-): Promise<{ cleanedCount: number; failedCount: number }> {
-  // Correct SQL precedence: wrap OR condition in parentheses
+  userId?: number,
+  workerId?: string
+): Promise<{ cleanedCount: number; failedCount: number; skippedCount: number }> {
+  const currentWorkerId =
+    workerId ||
+    (typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `worker-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+
+  // 1. Select candidate records for cleanup (PENDING_DELETE, expired RESERVED > 5m, or expired CLEANING lease > 5m)
   let query = `
-    SELECT id, user_id, r2_key, status, created_at, cleanup_attempts 
+    SELECT id, user_id, r2_key, status, created_at, cleanup_attempts, cleanup_generation 
     FROM job_photos 
     WHERE (
       status = 'PENDING_DELETE' 
       OR (status = 'RESERVED' AND created_at < datetime('now', '-5 minutes'))
+      OR (status = 'CLEANING' AND created_at < datetime('now', '-5 minutes'))
     )
   `;
   const params: any[] = [];
@@ -872,20 +895,41 @@ export async function cleanupOrphanedPhotos(
     status: string;
     created_at: string;
     cleanup_attempts: number;
+    cleanup_generation: number;
   }>();
 
   let cleanedCount = 0;
   let failedCount = 0;
+  let skippedCount = 0;
 
   for (const row of results || []) {
-    // Atomically transition RESERVED to PENDING_DELETE so in-flight delayed activation is fenced out
-    if (row.status === "RESERVED") {
-      await db
-        .prepare("UPDATE job_photos SET status = 'PENDING_DELETE' WHERE id = ? AND status = 'RESERVED'")
-        .bind(row.id)
-        .run();
+    // 2. Atomic CAS state transition to 'CLEANING' with generation increment and lease ownership.
+    // Check affected-row count before performing any external operation to prevent stale/simultaneous sweepers.
+    const claimRes = await db
+      .prepare(
+        `UPDATE job_photos 
+         SET status = 'CLEANING', 
+             cleanup_worker_id = ?, 
+             cleanup_generation = COALESCE(cleanup_generation, 0) + 1,
+             slot_number = NULL
+         WHERE id = ? 
+           AND (
+             status = 'PENDING_DELETE' 
+             OR (status = 'RESERVED' AND created_at < datetime('now', '-5 minutes'))
+             OR (status = 'CLEANING' AND created_at < datetime('now', '-5 minutes'))
+           )`
+      )
+      .bind(currentWorkerId, row.id)
+      .run();
+
+    const affected = (claimRes as any)?.changes ?? (claimRes as any)?.meta?.changes ?? 0;
+    if (affected === 0) {
+      // Row was modified, claimed by another worker, or changed state concurrently. Skip!
+      skippedCount++;
+      continue;
     }
 
+    // 3. Perform external R2 deletion under verified exclusive lease
     let r2Success = false;
     let r2Error = "";
     try {
@@ -897,25 +941,43 @@ export async function cleanupOrphanedPhotos(
     }
 
     if (r2Success) {
-      // ONLY delete from D1 if R2 deletion succeeded
-      await db.prepare("DELETE FROM job_photos WHERE id = ?").bind(row.id).run();
-      cleanedCount++;
+      // 4a. Conditional D1 row deletion: verify ownership and status before deleting
+      const delRes = await db
+        .prepare(
+          `DELETE FROM job_photos 
+           WHERE id = ? 
+             AND status = 'CLEANING' 
+             AND cleanup_worker_id = ?`
+        )
+        .bind(row.id, currentWorkerId)
+        .run();
+
+      const delAffected = (delRes as any)?.changes ?? (delRes as any)?.meta?.changes ?? 0;
+      if (delAffected > 0) {
+        cleanedCount++;
+      } else {
+        skippedCount++;
+      }
     } else {
-      // Retain D1 reference, increment attempts and store error for retry
+      // 4b. Revert to PENDING_DELETE with diagnostic error and incremented retry count
       failedCount++;
       await db
         .prepare(
           `UPDATE job_photos 
-           SET cleanup_attempts = COALESCE(cleanup_attempts, 0) + 1, 
-               last_cleanup_error = ? 
-           WHERE id = ?`
+           SET status = 'PENDING_DELETE', 
+               cleanup_attempts = COALESCE(cleanup_attempts, 0) + 1, 
+               last_cleanup_error = ?,
+               cleanup_worker_id = NULL 
+           WHERE id = ? 
+             AND status = 'CLEANING' 
+             AND cleanup_worker_id = ?`
         )
-        .bind(r2Error, row.id)
+        .bind(r2Error, row.id, currentWorkerId)
         .run();
     }
   }
 
-  return { cleanedCount, failedCount };
+  return { cleanedCount, failedCount, skippedCount };
 }
 
 // 8. Mission Control Dashboard Aggregation (Zero N+1 Queries)

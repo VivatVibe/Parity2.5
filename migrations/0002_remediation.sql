@@ -7,9 +7,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_idempotency ON job_payments(user_
 
 -- 2. Photo Quota Slot, Concurrency Lifecycle & Retry Metadata
 ALTER TABLE job_photos ADD COLUMN slot_number INTEGER CHECK(slot_number BETWEEN 1 AND 5);
-ALTER TABLE job_photos ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('RESERVED', 'ACTIVE', 'PENDING_DELETE', 'FAILED'));
+ALTER TABLE job_photos ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('RESERVED', 'ACTIVE', 'PENDING_DELETE', 'FAILED', 'CLEANING'));
 ALTER TABLE job_photos ADD COLUMN cleanup_attempts INTEGER DEFAULT 0;
 ALTER TABLE job_photos ADD COLUMN last_cleanup_error TEXT;
+ALTER TABLE job_photos ADD COLUMN cleanup_worker_id TEXT;
+ALTER TABLE job_photos ADD COLUMN cleanup_generation INTEGER DEFAULT 0;
 
 -- 3. Deterministic Backfill of slot_number for Existing Photos (1..5 per job ordered by id ASC)
 UPDATE job_photos
@@ -26,10 +28,10 @@ WHERE slot_number IS NULL AND (
   ) t WHERE t.id = job_photos.id
 ) <= 5;
 
--- 4. Mark legacy surplus photos beyond 5 as PENDING_DELETE
-UPDATE job_photos
-SET status = 'PENDING_DELETE'
-WHERE slot_number IS NULL;
+-- 4. Surplus Photos Beyond 5:
+-- Preexisting customer photos beyond quota are PRESERVED with status = 'ACTIVE' and slot_number = NULL.
+-- Existing customer data is NEVER automatically deleted without an explicit retention policy.
+-- Future uploads will respect the max 5 active quota constraint.
 
 -- 5. Safe Unique Indexes
 CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_job_slot ON job_photos(job_id, slot_number);

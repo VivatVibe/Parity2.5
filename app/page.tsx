@@ -3,6 +3,7 @@
 import { useEffect, useState, useTransition } from "react";
 import Link from "next/link";
 import type { DashboardData, DashboardJobItem } from "@/src/lib/db";
+import { executePaymentWithRetry } from "@/src/lib/payment-client";
 
 export default function MissionControlDashboard() {
   const [data, setData] = useState<DashboardData | null>(null);
@@ -67,24 +68,22 @@ export default function MissionControlDashboard() {
 
     try {
       setCollectingRetainerId(job.id);
-      const opId = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-      const idempotencyKey = `ret-collect-${job.id}-${period}-${opId}`;
-      const res = await fetch(`/api/jobs/${job.id}/payments`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Idempotency-Key": idempotencyKey,
-        },
-        body: JSON.stringify({
-          amount: amountToCollect,
-          parts_cost: 0,
-          payment_type: "RETAINER_CYCLE",
-          billing_period: period,
-          note: "1-Click Collect from Dashboard",
-          idempotency_key: idempotencyKey,
-        }),
+      const storage = typeof window !== "undefined" ? window.localStorage : null;
+      const result = await executePaymentWithRetry({
+        jobId: job.id,
+        amount: amountToCollect,
+        partsCost: 0,
+        paymentType: "RETAINER_CYCLE",
+        billingPeriod: period,
+        note: "1-Click Collect from Dashboard",
+        storage,
+        fetchFn: fetch,
       });
-      if (!res.ok) throw new Error("Failed to record retainer payment");
+
+      if (!result.ok) {
+        throw new Error(result.error || "Failed to record retainer payment");
+      }
+
       await fetchDashboard(searchQuery);
     } catch (err: any) {
       alert("Error: " + err.message);

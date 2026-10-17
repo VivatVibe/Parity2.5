@@ -6,6 +6,7 @@
 interface StorageItem {
   data: Uint8Array;
   contentType: string;
+  uploaded: Date;
 }
 
 // In-memory fallback for local dev and automated tests ONLY
@@ -72,7 +73,7 @@ export async function putPhoto(
     if (process.env.NODE_ENV === "production") {
       throw new Error("Cloudflare R2 binding is required in production");
     }
-    memoryStore.set(key, { data: buffer, contentType });
+    memoryStore.set(key, { data: buffer, contentType, uploaded: new Date() });
   }
 }
 
@@ -105,6 +106,82 @@ export async function deletePhoto(r2: any, key: string): Promise<void> {
     }
     memoryStore.delete(key);
   }
+}
+
+/**
+ * Lists objects in storage matching an optional key prefix.
+ */
+export async function listPhotos(
+  r2: any,
+  prefix?: string
+): Promise<{ key: string; uploaded: Date; size?: number }[]> {
+  if (r2 && typeof r2.list === "function") {
+    const listRes = await r2.list({ prefix });
+    return (listRes.objects || []).map((o: any) => ({
+      key: o.key,
+      uploaded: o.uploaded instanceof Date ? o.uploaded : new Date(o.uploaded || Date.now()),
+      size: o.size,
+    }));
+  } else {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error("Cloudflare R2 binding is required in production");
+    }
+    const results: { key: string; uploaded: Date; size?: number }[] = [];
+    for (const [key, item] of memoryStore.entries()) {
+      if (!prefix || key.startsWith(prefix)) {
+        results.push({
+          key,
+          uploaded: item.uploaded || new Date(),
+          size: item.data.length,
+        });
+      }
+    }
+    return results;
+  }
+}
+
+/**
+ * P0-01: Cross-Service Storage Reconciler.
+ * Eliminates late-writer orphans created when an R2 PUT completes after a reservation
+ * expired, was swept, and the upload handler crashed before compensation.
+ *
+ * Any R2 object whose age exceeds safetyGracePeriodMs and has no active D1 record is purged.
+ */
+export async function reconcileR2Storage(
+  r2: any,
+  db: any,
+  options?: {
+    prefix?: string;
+    safetyGracePeriodMs?: number;
+  }
+): Promise<{ scannedCount: number; deletedOrphans: string[] }> {
+  const safetyGracePeriodMs = options?.safetyGracePeriodMs ?? 5 * 60 * 1000;
+  const prefix = options?.prefix ?? "users/";
+  const objects = await listPhotos(r2, prefix);
+
+  const deletedOrphans: string[] = [];
+  const now = Date.now();
+
+  for (const obj of objects) {
+    const uploadedMs = obj.uploaded ? new Date(obj.uploaded).getTime() : 0;
+    // Skip if within safety grace period so in-flight uploads can finish activating
+    if (safetyGracePeriodMs > 0 && now - uploadedMs < safetyGracePeriodMs) {
+      continue;
+    }
+
+    const activePhoto = await db
+      .prepare("SELECT id FROM job_photos WHERE r2_key = ? AND status = 'ACTIVE' LIMIT 1")
+      .bind(obj.key)
+      .first<{ id: number }>();
+
+    if (!activePhoto) {
+      // Unreferenced orphan detected! Delete from R2 storage.
+      await deletePhoto(r2, obj.key);
+      deletedOrphans.push(obj.key);
+    }
+  }
+
+  return { scannedCount: objects.length, deletedOrphans };
 }
 
 export function clearMemoryStorage(): void {
