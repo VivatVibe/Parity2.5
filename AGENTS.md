@@ -15,3 +15,7 @@ Standard 5-role triage vocabulary mapped directly on GitHub. See `docs/agents/tr
 ### Domain docs
 
 Single-context layout (`GLOSSARY.md` at root and `docs/adr/`). See `docs/agents/domain.md`.
+
+### Architecture & Edge Standards
+
+Next.js on Cloudflare Workers, D1, and R2 edge rules. See `.agents/rules/cloudflare-edge-standards.md`.
