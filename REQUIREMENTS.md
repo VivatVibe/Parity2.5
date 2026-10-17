@@ -1,118 +1,120 @@
-# Parity 2.5 — Requirements & Technical Blueprint
-> **ปรัชญา:** ตัดหนี้ทางเทคทั้งหมดทิ้ง เริ่มจากศูนย์ด้วยหลักการ "Boring, Lean, Zero-bloat" (Ponytail Senior Dev Mode)
+# Parity 2.5 — Requirements & Blueprint (Universal Solo Hub)
+> **ปรัชญา:** "Boring, Lean, Zero-bloat" (Ponytail Senior Dev Mode) + **Ai-Hero (Matt Pocock)** Domain Modeling
 
 ---
 
 ## 1. Core Problem & User
-- **ปัญหาหลัก:** ช่างซ่อมคอมพิวเตอร์/อุปกรณ์ IT ต้องการบันทึกและติดตามงานซ่อม ไม่ให้งานตกหล่น รู้ว่าเครื่องใคร มาทำอะไร ซ่อมถึงไหน และคิดเงินเท่าไหร่
-- **ผู้ใช้งาน:** ช่างคนเดียว (Single Owner / Solo Technician) ในร้านซ่อม IT
-- **อุปกรณ์ที่รองรับ:** คอมพิวเตอร์ตั้งโต๊ะ, โน้ตบุ๊ก, ปริ้นเตอร์, แท็บเล็ต, มือถือ, และอุปกรณ์ IT ทั่วไป
+- **ปัญหาหลัก:** ผู้ประกอบการคนเดียว (Solo Worker / Freelancer) ที่ให้บริการหลายรูปแบบ ทั้ง **งานซ่อมคอม/ฮาร์ดแวร์**, **งานออนไลน์รายโปรเจกต์ (SEO/Web)**, และ **งานบริการรายเดือน (Monthly Retainer/Web Care)** ต้องการระบบเดียวที่จัดการลูกค้า ติดตามสถานะงาน ไม่ให้งานตกหล่น และตามเก็บเงินได้ครบถ้วน
+- **ผู้ใช้งาน:** เจ้าของคนเดียว (Single Owner) จัดการงานทั้งหมดจากมือถือหรือคอมพิวเตอร์
+- **ประเภทงานที่รองรับ:**
+  1. `REPAIR`: งานซ่อมคอมพิวเตอร์ / โน้ตบุ๊ก / อุปกรณ์ IT (รับเครื่อง, อะไหล่, รูปถ่ายสภาพ)
+  2. `PROJECT`: งานออนไลน์เป็นจ็อบ เช่น ทำ SEO Audit, ปรับแต่ง On-page, ขึ้นเว็บไซต์ใหม่
+  3. `RETAINER`: งานดูแลรายเดือน เช่น ดูแลเว็บไซต์ประจำเดือน, ทำ SEO ประจำเดือน (มีรอบบิลเก็บเงิน)
 
 ---
 
-## 2. ขอบเขตฟังก์ชันหลัก (The 3 Core Workflows)
+## 2. ขอบเขตฟังก์ชันหลัก (Core Workflows)
 
-### 2.1 รับเครื่องเข้าซ่อม (Job Intake)
-- **ข้อมูลลูกค้า:** ชื่อ, เบอร์โทรศัพท์ (จำเป็น)
-- **ข้อมูลอุปกรณ์:** 
-  - ประเภทอุปกรณ์ (Dropdown เช่น Notebook, PC, Printer, Phone, Other)
-  - ยี่ห้อ / รุ่น (Text)
-  - Serial Number (ไม่บังคับ)
-  - อาการเสียที่แจ้ง (Textarea)
-  - อุปกรณ์ที่ติดมาด้วย (เช่น สายชาร์จ, เมาส์, กระเป๋า)
-- **รูปถ่ายสภาพตอนรับ:** ถ่ายจากกล้องมือถือ/แท็บเล็ต หรืออัปโหลดรูป (สูงสุด 5 รูปต่อใบงาน)
-- **รหัสใบงาน (Job Number):** รันอัตโนมัติ เข้าใจง่าย เช่น `PR-2026-0001`
-- **เอาต์พุต:** บันทึกลงระบบทันที + สามารถพิมพ์/แคปหน้าใบรับเครื่องให้ลูกค้าได้
+### 2.1 รับงาน / เปิดจ็อบ (Job Intake)
+- **เลือกลูกค้า:** ค้นหาลูกค้าเดิม (จากเบอร์/ชื่อ) หรือกรอกลูกค้าใหม่
+- **เลือกประเภทงาน (`JobType`):**
+  - หากเป็น **`REPAIR`**: ระบุประเภทอุปกรณ์, ยี่ห้อ/รุ่น, อาการเสีย, อุปกรณ์ที่ติดมาด้วย, ถ่ายรูปสภาพเครื่อง (จัดเก็บใน Cloudflare R2)
+  - หากเป็น **`PROJECT`**: ระบุชื่องาน, รายละเอียด Scope, กำหนดส่ง (Deadline), ลิงก์แนบงาน (Google Drive, Figma, Docs)
+  - หากเป็น **`RETAINER`**: ระบุขอบเขตงานรายเดือน, วันที่ตัดรอบบิล (เช่น ทุกวันที่ 1 ของเดือน), อัตราค่าบริการรายเดือน
+- **การเงินเริ่มต้น:** ระบุมูลค่างาน, เงินมัดจำ (ถ้ามี)
+- **รหัสใบงาน:** ออกรหัสออโต้ตามประเภทงาน เช่น `PR-2026-0001` (Repair), `PJ-2026-0001` (Project), `RT-2026-0001` (Retainer)
 
-### 2.2 คิวงานและสถานะการซ่อม (Job Board & Tracking)
-- **สถานะมีเพียง 5 สถานะที่จำเป็นจริง:**
-  1. `RECEIVED` (รับเครื่องแล้ว)
-  2. `IN_PROGRESS` (กำลังตรวจเช็ค/กำลังซ่อม)
-  3. `WAITING_PARTS` (รออะไหล่)
-  4. `COMPLETED` (ซ่อมเสร็จ รอส่งมอบ)
-  5. `DELIVERED` (ส่งมอบลูกค้าแล้ว / ปิดงาน)
-  *(สถานะยกเลิก `CANCELLED` สามารถเลือกได้)*
-- **ค้นหางานได้เร็ว (Instant Search):** ค้นจากเบอร์โทร, ชื่อลูกค้า, หรือรหัสใบงาน
-- **บันทึกงานซ่อม:** ช่างบันทึกสิ่งที่ทำ (Technician Notes) และค่าใช้จ่าย (ค่าแรง + ค่าอะไหล่)
+### 2.2 คิวงานและกระดานติดตาม (Unified Job Board)
+- รวมทุกงานในหน้าเดียว หรือกรองดูตามประเภท (`All` | `Repair` | `Project` | `Retainer`)
+- **สถานะงาน (Job Status):**
+  1. `RECEIVED` (รับเรื่อง/รอดำเนินการ)
+  2. `IN_PROGRESS` (กำลังดำเนินการ)
+  3. `WAITING` (รอข้อมูลจากลูกค้า หรือ รออะไหล่)
+  4. `COMPLETED` (ทำเสร็จแล้ว รอส่งมอบ/ส่งรายงาน)
+  5. `DELIVERED` (ส่งมอบงานแล้ว / ปิดจ็อบ)
+- **ระบบเตือนรอบบิลรายเดือน (Retainer Reminder):** แสดงรายการงานรายเดือนที่ใกล้ถึงรอบบิล หรือยังไม่ได้ชำระเงินในรอบปัจจุบัน
+- **ค้นหาด่วน (Quick Search):** ค้นจากชื่อลูกค้า, เบอร์โทร, หรือรหัสงาน
 
-### 2.3 ปิดงานและส่งมอบ (Handover & Receipt)
-- สรุปยอดเงินรวม
-- บันทึกการส่งมอบ (วันเวลาที่ลูกค้ารับเครื่องคืน)
-- แสดงหน้าใบสรุปงาน (Digital Receipt / Slip) สำหรับส่งให้ลูกค้าทาง LINE หรือพิมพ์เป็นกระดาษ
+### 2.3 ปิดงานและสรุปการเงิน (Handover & Slip)
+- สรุปยอดเงิน: ค่าบริการ, ค่าอะไหล่/ค่าใช้จ่ายเสริม, ยอดคงเหลือที่ต้องเก็บ
+- บันทึกการรับเงิน: ระบุวิธีชำระและวันที่รับเงิน
+- แสดงหน้าสลิป / ใบสรุปงานดิจิทัล (Clean Mobile Slip View) สำหรับแคปส่ง LINE หรือพิมพ์
 
 ---
 
-## 3. สิ่งที่ตัดทิ้งอย่างเด็ดขาด (Anti-Features / YAGNI List)
+## 3. สถาปัตยกรรมทางเทคนิค (The Stack)
 
-| สิ่งที่ตัดทิ้ง (Tech Debt จาก Parity เดิม) | เหตุผลที่ตัด | สิ่งที่ใช้แทน |
-|---|---|---|
-| ❌ Monorepo / pnpm workspace | โครงสร้างซับซ้อน overhead สูงเกินความจำเป็น | **Single Repo แบนราบไฟล์เดียว/โฟลเดอร์เดียว** |
-| ❌ Multi-role Auth / Cloudflare Access ซับซ้อน | มีช่างใช้งานคนเดียว ไม่จำเป็นต้องมี RBAC | **รหัสผ่านเดียว (Single PIN/Password) หรือ Local session** |
-| ❌ Cloudflare Multi-env (Workers + D1 + R2 + Workflows) แต่ Day 1 | Setup ยาก รัน offline ไม่ได้ ติด vendor-lock | **SQLite ไฟล์เดียว + Local/S3 storage ธรรมดา** |
-| ❌ Custom Design System / Token ซับซ้อน | เปลืองแรงเขียน CSS และดูแล code token | **Native HTML + Utility CSS เรียบง่าย (เช่น Tailwind หรือ CSS พื้นฐาน)** |
-| ❌ AI Runner Loops & Multi-agent review scripts | เป็นภาระในการบำรุงรักษาและรันงาน | **การพัฒนาแบบตรงไปตรงมา ทดสอบผ่าน runnable test 1 ตัว** |
-| ❌ แผนงาน 10 Iterations ล่วงหน้า | Over-speculative วางแผนในสิ่งที่ยังไม่ได้ใช้ | **ทำ Phase 1 ให้ใช้ได้จริงก่อน แล้วจึงขยายตาม feedback** |
+- **Framework:** Next.js (App Router)
+- **Runtime:** Cloudflare Pages / Workers
+- **Database:** Cloudflare D1 (SQLite) — ไร้หนี้ทางเทค Zero-ops
+- **Object Storage:** Cloudflare R2 — เก็บรูปถ่ายสภาพเครื่องและเอกสาร
+- **Issue & Task Tracker:** GitHub Issues บน `VivatVibe/Parity2.5`
+- **Development Skills:** Matt Pocock's Ai-Hero skill suite (`setup-matt-pocock-skills`, `grill-with-docs`, `to-spec`, `to-tickets`, `tdd`, `code-review`)
 
 ---
 
-## 4. โครงสร้างข้อมูล (Minimal Schema)
-
-ใช้ SQLite เพียง 3 ตารางหลัก:
+## 4. โครงสร้างข้อมูล (D1 SQLite Schema)
 
 ```sql
 -- ลูกค้า
-CREATE TABLE customers (
+CREATE TABLE clients (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
-  phone TEXT NOT NULL UNIQUE,
+  phone TEXT,
+  line_id TEXT,
+  notes TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- ใบงานซ่อม
+-- ใบงานหลัก (Unified Jobs)
 CREATE TABLE jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   job_number TEXT NOT NULL UNIQUE,
-  customer_id INTEGER NOT NULL REFERENCES customers(id),
+  client_id INTEGER NOT NULL REFERENCES clients(id),
+  job_type TEXT NOT NULL, -- 'REPAIR', 'PROJECT', 'RETAINER'
+  title TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'RECEIVED',
+  due_date TEXT, -- YYYY-MM-DD
+  billing_cycle_day INTEGER, -- 1-31 (เฉพาะ RETAINER)
+  total_amount REAL DEFAULT 0,
+  paid_amount REAL DEFAULT 0,
+  notes TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- รายละเอียดเฉพาะงานซ่อมคอมพิวเตอร์ (Hardware Repair Extension)
+CREATE TABLE job_repairs (
+  job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
   device_type TEXT NOT NULL,
   brand_model TEXT NOT NULL,
   serial_number TEXT,
   symptoms TEXT NOT NULL,
   accessories TEXT,
-  status TEXT NOT NULL DEFAULT 'RECEIVED',
-  technician_notes TEXT,
   cost_parts REAL DEFAULT 0,
-  cost_labor REAL DEFAULT 0,
-  total_cost REAL DEFAULT 0,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  cost_labor REAL DEFAULT 0
 );
 
--- รูปภาพประกอบใบงาน
+-- รูปถ่ายสภาพเครื่อง (Hardware Photos in R2)
 CREATE TABLE job_photos (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-  file_path TEXT NOT NULL,
+  r2_key TEXT NOT NULL,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- รายละเอียดเฉพาะงานออนไลน์ / SEO (Online & Project Extension)
+CREATE TABLE job_online_meta (
+  job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+  website_url TEXT,
+  deliverable_url TEXT, -- Google Drive, Figma, Report link
+  scope_notes TEXT
 );
 ```
 
 ---
 
-## 5. สถาปัตยกรรมทางเทคนิค (The Boring Cloudflare Stack)
-
-- **Full-stack Framework:** Next.js (App Router) — รวม Frontend และ API/Server Actions อยู่ในโปรเจกต์เดียว
-- **Runtime & Deployment:** Cloudflare Pages / Workers (ผ่าน `@opennextjs/cloudflare`)
-- **Database:** Cloudflare D1 (SQLite แท้บน Edge — ไม่ต้องรันเซิร์ฟเวอร์ฐานข้อมูลแยก, local dev ใช้ D1 local emulation)
-- **Object Storage:** Cloudflare R2 (จัดเก็บรูปภาพสภาพเครื่องก่อน-หลังซ่อม ผ่าน S3 API/R2 binding)
-- **โครงสร้างโปรเจกต์:** Single App แบนราบ (โฟลเดอร์เดียว, 1 `package.json`, 1 `wrangler.json`, ไม่มี Monorepo/pnpm workspace)
-- **การทดสอบ:** Runnable self-check สคริปต์สั้นๆ 1 ไฟล์ ทดสอบ D1 queries และ core logic ไม่ต้องมี test framework ซับซ้อน
-
----
-
-## 6. ลำดับการส่งมอบ (Immediate Next Step)
-
-- **Sprint 1 (Functional Core):**
-  1. สร้างโปรเจกต์ Single repo พร้อม SQLite schema
-  2. ฟอร์มรับเครื่อง (Intake) + อัปโหลดรูปสภาพ
-  3. หน้ารายการงานซ่อม (Job List) + อัปเดตสถานะ + บันทึกราคา
-  4. หน้าใบรับเครื่อง/ใบส่งมอบ (Printable View)
+## 5. กระบวนการพัฒนา (Ai-Hero Delivery Loop)
+1. **Grill & Refine Requirements:** ตรวจสอบความถูกต้องของโมเดลกับผู้ใช้ผ่าน Grilling interview
+2. **Spec & Ticket Breakdown:** แปลง Requirement เป็น Tracer-bullet tickets บน GitHub Issue (`VivatVibe/Parity2.5`)
+3. **TDD Implementation:** พัฒนาฟังก์ชันทีละ Ticket แบบ Test-Driven และผูก verification checks
