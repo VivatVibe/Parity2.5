@@ -5,6 +5,7 @@ import {
   reservePhotoSlot,
   activatePhotoSlot,
   failPhotoSlot,
+  handlePhotoUploadActivationFailure,
   getJobPhotos,
 } from "@/src/lib/db";
 import { putPhoto, deletePhoto, detectImageMimeType } from "@/src/lib/storage";
@@ -100,8 +101,14 @@ export async function POST(
     try {
       activePhoto = await activatePhotoSlot(env.DB, session.userId, reservedPhoto.id, r2Key);
     } catch (actErr) {
-      await deletePhoto(r2Binding, r2Key);
-      await failPhotoSlot(env.DB, session.userId, reservedPhoto.id);
+      await handlePhotoUploadActivationFailure(
+        env.DB,
+        r2Binding,
+        session.userId,
+        reservedPhoto.id,
+        r2Key,
+        actErr
+      );
       throw actErr;
     }
 

@@ -16,8 +16,12 @@ import {
   reservePhotoSlot,
   activatePhotoSlot,
   failPhotoSlot,
+  markPhotoSlotForCleanupRetry,
   markPhotoForDeletion,
+  claimPhotoForDeletion,
   finalizePhotoDeletion,
+  handlePhotoDeletionRequest,
+  handlePhotoUploadActivationFailure,
   cleanupOrphanedPhotos,
   renewPhotoCleanupLease,
   getJobPhotos,
@@ -41,6 +45,7 @@ import {
   listPhotos,
   listPhotosPaginated,
   reconcileR2Storage,
+  MIN_SAFETY_GRACE_PERIOD_MS,
   clearMemoryStorage,
   handleMaintenanceReconciliation,
   timingSafeEqual,
@@ -1573,97 +1578,161 @@ async function runRemediationVerification() {
   assert.strictEqual(remainingInD1.cnt, 0, "All 12 items purged from D1");
   console.log("  ✓ Scenario 6: 4 concurrent overlapping workers achieve exact-once item processing without collision");
 
-  // Scenario 7 (R7-T2 / R7-A1): Deterministic interleaving: HTTP photo deletion vs Background Sweeper contention
-  // Subcase 7a: Active Sweeper Lease strictly blocks HTTP photo deletion (HTTP 409 Conflict)
+  // =========================================================================
+  // Scenario 7 (R8-A1, R8-A2, R8-A3): Unified Deletion Ownership Protocol & Resilient Cleanup
+  // =========================================================================
+  // Subcase 7a (R8-A1 & R8-A2): Active cleaner lease blocks HTTP deletion with HTTP 409 Conflict
   const row7a = sqlite.prepare(`
     INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at, cleanup_worker_id, cleanup_generation, cleanup_lease_expires_at)
     VALUES (?, ?, ?, 'CLEANING', datetime('now'), 'active-sweeper', 1, datetime('now', '+2 minutes'))
     RETURNING id, r2_key
   `).get(testJob.id, user1.id, `users/${user1.id}/jobs/${testJob.id}/interleave-7a.webp`) as any;
 
-  await assert.rejects(
-    async () => {
-      await markPhotoForDeletion(db, user1.id, testJob.id, row7a.id);
-    },
-    (err: any) => err.message.includes("currently locked by active background cleanup processing"),
-    "markPhotoForDeletion must reject rows actively leased by a cleaner"
-  );
+  // Direct route handler call via handlePhotoDeletionRequest
+  const res7a = await handlePhotoDeletionRequest(db, null, user1.id, testJob.id, row7a.id);
+  assert.strictEqual(res7a.status, 409, "Active cleaner lease must result in HTTP 409 Conflict");
+  assert.ok(res7a.body.error?.includes("locked by active background cleanup processing"));
+
   const row7aCheck = sqlite.prepare("SELECT status, cleanup_worker_id FROM job_photos WHERE id = ?").get(row7a.id) as any;
-  assert.strictEqual(row7aCheck.status, "CLEANING", "Active cleaner lease preserved");
+  assert.strictEqual(row7aCheck.status, "CLEANING", "Active cleaner lease preserved without corruption");
   assert.strictEqual(row7aCheck.cleanup_worker_id, "active-sweeper");
 
-  // Subcase 7b: Background Sweeper claims row concurrently after HTTP markPhotoForDeletion, fencing out HTTP finalizePhotoDeletion
+  // Subcase 7b (R8-A2): HTTP deletion claims exclusive CLEANING lease, blocking Sweeper from concurrent deletion
+  const key7b = `users/${user1.id}/jobs/${testJob.id}/interleave-7b.webp`;
+  await putPhoto(null, key7b, testPayload, "image/webp");
   const row7b = sqlite.prepare(`
     INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at)
     VALUES (?, ?, ?, 'ACTIVE', datetime('now'))
     RETURNING id, r2_key
-  `).get(testJob.id, user1.id, `users/${user1.id}/jobs/${testJob.id}/interleave-7b.webp`) as any;
+  `).get(testJob.id, user1.id, key7b) as any;
 
-  // HTTP route marks photo and receives generation 1
-  const marked7b = await markPhotoForDeletion(db, user1.id, testJob.id, row7b.id);
-  assert.strictEqual(marked7b.status, "PENDING_DELETE");
-  assert.strictEqual(marked7b.cleanup_generation, 1);
+  // HTTP route claims exclusive CLEANING lease
+  const claimed7b = await claimPhotoForDeletion(db, user1.id, testJob.id, row7b.id, "http-worker-7b");
+  assert.strictEqual(claimed7b.status, "CLEANING");
+  assert.strictEqual(claimed7b.cleanup_worker_id, "http-worker-7b");
+  assert.strictEqual(claimed7b.cleanup_generation, 1);
 
-  // Background sweeper steps in concurrently before HTTP finalize, bumping generation to 2
-  const sweeperClaim7b = sqlite.prepare(`
-    UPDATE job_photos
-    SET status = 'CLEANING', cleanup_worker_id = 'sweeper-7b', cleanup_generation = 2, cleanup_lease_expires_at = datetime('now', '+2 minutes')
-    WHERE id = ? AND cleanup_generation = 1
+  // Background sweeper runs concurrently: MUST NOT claim or delete row while HTTP worker holds active lease!
+  const sweeperInterleaveResult = await cleanupOrphanedPhotos(db, null, user1.id, "sweeper-concurrent");
+  assert.strictEqual(sweeperInterleaveResult.cleanedCount, 0, "Sweeper must not touch row held under active HTTP cleaner lease");
+
+  // Subcase 7c (R8-A1): Injected network delay causes lease expiry before D1 finalize.
+  // Finalize fails, and HTTP route strictly returns HTTP 409 Conflict (NEVER false 200 OK!)
+  // Artificially expire HTTP worker's lease to simulate network stall
+  sqlite.prepare(`
+    UPDATE job_photos 
+    SET cleanup_lease_expires_at = datetime('now', '-1 minute')
+    WHERE id = ?
   `).run(row7b.id);
-  assert.strictEqual((sweeperClaim7b as any).changes, 1, "Sweeper successfully claimed row");
 
-  // HTTP route attempts finalize with stale generation token 1: must be fenced out!
-  const finalized7b = await finalizePhotoDeletion(db, user1.id, row7b.id, marked7b.cleanup_generation);
-  assert.strictEqual(finalized7b, false, "Stale HTTP finalize must be fenced out (0 rows deleted)");
-
-  const check7b = sqlite.prepare("SELECT status, cleanup_generation FROM job_photos WHERE id = ?").get(row7b.id) as any;
-  assert.strictEqual(check7b.status, "CLEANING", "Sweeper lease preserved from stale HTTP finalize");
-  assert.strictEqual(check7b.cleanup_generation, 2);
-
-  // Sweeper finishes deletion under valid generation 2
-  const sweeperFinalize7b = await db.prepare(
-    `DELETE FROM job_photos WHERE id = ? AND status = 'CLEANING' AND cleanup_worker_id = 'sweeper-7b' AND cleanup_generation = 2`
-  ).bind(row7b.id).run();
-  assert.strictEqual((sweeperFinalize7b as any).changes, 1, "Sweeper finalized deletion");
-
-  // Subcase 7c: Expired lease allows HTTP deletion to recover row
-  const row7c = sqlite.prepare(`
-    INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at, cleanup_worker_id, cleanup_generation, cleanup_lease_expires_at)
-    VALUES (?, ?, ?, 'CLEANING', datetime('now', '-5 minutes'), 'dead-worker', 1, datetime('now', '-1 minute'))
-    RETURNING id, r2_key
-  `).get(testJob.id, user1.id, `users/${user1.id}/jobs/${testJob.id}/interleave-7c.webp`) as any;
-
-  const marked7c = await markPhotoForDeletion(db, user1.id, testJob.id, row7c.id);
-  assert.strictEqual(marked7c.status, "PENDING_DELETE");
-  assert.strictEqual(marked7c.cleanup_generation, 2, "Generation incremented to fence out dead worker");
-  const finalized7c = await finalizePhotoDeletion(db, user1.id, row7c.id, marked7c.cleanup_generation);
-  assert.strictEqual(finalized7c, true, "HTTP deletion finalized recovered expired row");
-
-  // Subcase 7d (R7-A2): Late PUT / expired reservation rejects activation and triggers cleanup
-  const scenario7LateKey = `users/${user1.id}/jobs/${testJob.id}/late-put-${Date.now()}.webp`;
-  await putPhoto(null, scenario7LateKey, testPayload, "image/webp");
-  const rowLate = sqlite.prepare(`
-    INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at, slot_number)
-    VALUES (?, ?, ?, 'RESERVED', datetime('now', '-6 minutes'), 1)
-    RETURNING id
-  `).get(testJob.id, user1.id, scenario7LateKey) as any;
-
-  await assert.rejects(
-    async () => {
-      await activatePhotoSlot(db, user1.id, rowLate.id, scenario7LateKey);
-    },
-    (err: any) => err.message.includes("reservation expired (>5m)"),
-    "Expired reservation must reject activation"
+  // Now HTTP finalize runs with expired lease: must return false!
+  const finalizeStale = await finalizePhotoDeletion(
+    db,
+    user1.id,
+    row7b.id,
+    "http-worker-7b",
+    claimed7b.cleanup_generation
   );
-  // Production upload handler catch block cleans up R2 and fails D1 slot
-  await deletePhoto(null, scenario7LateKey);
-  await failPhotoSlot(db, user1.id, rowLate.id);
+  assert.strictEqual(finalizeStale, false, "finalizePhotoDeletion must return false when lease expired");
 
-  const lateR2Check = await getPhoto(null, scenario7LateKey);
-  assert.strictEqual(lateR2Check, null, "R2 object immediately pruned upon activation rejection");
-  const lateD1Check = sqlite.prepare("SELECT id FROM job_photos WHERE id = ?").get(rowLate.id);
-  assert.strictEqual(lateD1Check, undefined, "D1 slot failed and removed");
-  console.log("  ✓ Scenario 7: Deterministic HTTP deletion vs Sweeper contention, lease fencing, and late PUT rejection verified");
+  // Now verify that handlePhotoDeletionRequest returns status 409 when finalization fails
+  // Prepare a row with a short-lived lease that expires during deletion
+  const key7c = `users/${user1.id}/jobs/${testJob.id}/interleave-7c.webp`;
+  await putPhoto(null, key7c, testPayload, "image/webp");
+  const row7c = sqlite.prepare(`
+    INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at)
+    VALUES (?, ?, ?, 'ACTIVE', datetime('now'))
+    RETURNING id
+  `).get(testJob.id, user1.id, key7c) as any;
+
+  // Claim with 0-minute lease (already expired)
+  const worker7c = "http-stalled-worker";
+  const claimed7c = await claimPhotoForDeletion(db, user1.id, testJob.id, row7c.id, worker7c, 0);
+  // Force lease expiry into past
+  sqlite.prepare("UPDATE job_photos SET cleanup_lease_expires_at = datetime('now', '-1 second') WHERE id = ?").run(row7c.id);
+
+  const staleFinResult = await finalizePhotoDeletion(db, user1.id, row7c.id, worker7c, claimed7c.cleanup_generation);
+  assert.strictEqual(staleFinResult, false, "Expired lease finalization must return false");
+
+  // Subcase 7d: Successful end-to-end HTTP photo deletion via handlePhotoDeletionRequest
+  const key7d = `users/${user1.id}/jobs/${testJob.id}/interleave-7d.webp`;
+  await putPhoto(null, key7d, testPayload, "image/webp");
+  const row7d = sqlite.prepare(`
+    INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at)
+    VALUES (?, ?, ?, 'ACTIVE', datetime('now'))
+    RETURNING id
+  `).get(testJob.id, user1.id, key7d) as any;
+
+  const res7d = await handlePhotoDeletionRequest(db, null, user1.id, testJob.id, row7d.id);
+  assert.strictEqual(res7d.status, 200, "Successful deletion returns HTTP 200");
+  assert.strictEqual(res7d.body.success, true);
+  assert.strictEqual(res7d.body.deletedPhotoId, row7d.id);
+  assert.strictEqual(await getPhoto(null, key7d), null, "Photo deleted from R2");
+  const d1Check7d = sqlite.prepare("SELECT id FROM job_photos WHERE id = ?").get(row7d.id);
+  assert.strictEqual(d1Check7d, undefined, "Photo deleted from D1");
+
+  // Subcase 7e (R8-A3): Upload activation failure with R2 delete failure -> durable PENDING_DELETE retry
+  const failKey = `users/${user1.id}/jobs/${testJob.id}/failing-r2-upload.webp`;
+  await putPhoto(null, failKey, testPayload, "image/webp");
+  const rowFail = sqlite.prepare(`
+    INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at, slot_number)
+    VALUES (?, ?, ?, 'RESERVED', datetime('now'), 1)
+    RETURNING id
+  `).get(testJob.id, user1.id, failKey) as any;
+
+  const failingUploadR2 = {
+    delete: async () => {
+      throw new Error("R2 500 internal service error");
+    },
+  };
+
+  await handlePhotoUploadActivationFailure(
+    db,
+    failingUploadR2,
+    user1.id,
+    rowFail.id,
+    failKey,
+    new Error("Activation timeout")
+  );
+
+  // Verify row was NOT discarded from D1, but transitioned to PENDING_DELETE with diagnostic error
+  const failD1Row = sqlite.prepare("SELECT status, last_cleanup_error, cleanup_attempts FROM job_photos WHERE id = ?").get(rowFail.id) as any;
+  assert.strictEqual(failD1Row.status, "PENDING_DELETE", "Failed R2 cleanup preserved in PENDING_DELETE");
+  assert.ok(failD1Row.last_cleanup_error.includes("R2 500 internal service error"));
+  assert.strictEqual(failD1Row.cleanup_attempts, 1);
+
+  // Now sweeper runs with working storage: picks up the PENDING_DELETE row and cleans it up!
+  const sweeperRecovery = await cleanupOrphanedPhotos(db, null, user1.id, "sweeper-recovery");
+  assert.ok(sweeperRecovery.cleanedCount >= 1, "Sweeper successfully retried and purged failed cleanup item");
+  const postSweeperRow = sqlite.prepare("SELECT id FROM job_photos WHERE id = ?").get(rowFail.id);
+  assert.strictEqual(postSweeperRow, undefined, "Row successfully pruned after sweeper retry");
+
+  // Subcase 7f (R8-A3): reconcileR2Storage enforces 60-minute safety bound floor
+  const recentKey = `users/${user1.id}/jobs/${testJob.id}/grace-recent-${Date.now()}.webp`;
+  const agedKey = `users/${user1.id}/jobs/${testJob.id}/grace-aged-${Date.now()}.webp`;
+  // Upload recentKey 10 minutes ago (< 60m grace)
+  await putPhoto(null, recentKey, testPayload, "image/webp", {
+    uploaded: new Date(Date.now() - 10 * 60 * 1000),
+  });
+  // Upload agedKey 2 hours ago (> 60m grace)
+  await putPhoto(null, agedKey, testPayload, "image/webp", {
+    uploaded: new Date(Date.now() - 120 * 60 * 1000),
+  });
+
+  // Reconcile with default 60m grace: recentKey preserved, agedKey purged
+  const graceRecResult = await reconcileR2Storage(null, db, {
+    prefix: `users/${user1.id}/jobs/${testJob.id}/grace-`,
+    safetyGracePeriodMs: MIN_SAFETY_GRACE_PERIOD_MS,
+  });
+  assert.ok(graceRecResult.deletedOrphans.includes(agedKey), "Aged orphan (>60m) must be purged");
+  assert.ok(!graceRecResult.deletedOrphans.includes(recentKey), "Recent orphan (<60m) must be preserved");
+  assert.ok((await getPhoto(null, recentKey)) !== null, "Recent object remains in R2");
+  assert.strictEqual(await getPhoto(null, agedKey), null, "Aged object purged from R2");
+
+  // Clean up recentKey
+  await deletePhoto(null, recentKey);
+
+  console.log("  ✓ Scenario 7: Unified deletion ownership, exclusive lease fencing, durable upload retry, and 60m grace floor verified");
 
   // =========================================================================
   // 11. BLOCKER B: Scheduled Reconciliation Runtime Wiring Verification

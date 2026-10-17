@@ -63,7 +63,8 @@ export async function putPhoto(
   r2: any,
   key: string,
   buffer: Uint8Array,
-  contentType: string
+  contentType: string,
+  options?: { uploaded?: Date }
 ): Promise<void> {
   if (r2 && typeof r2.put === "function") {
     await r2.put(key, buffer, {
@@ -74,7 +75,7 @@ export async function putPhoto(
     if (process.env.NODE_ENV === "production") {
       throw new Error("Cloudflare R2 binding is required in production");
     }
-    memoryStore.set(key, { data: buffer, contentType, uploaded: new Date() });
+    memoryStore.set(key, { data: buffer, contentType, uploaded: options?.uploaded || new Date() });
   }
 }
 
@@ -183,6 +184,8 @@ export async function listPhotos(
  *   aborting the scan, allowing subsequent cron executions to retry.
  * - Scan Interruption & Resumption: Respects `maxObjectsToScan` and returns continuation cursors.
  */
+export const MIN_SAFETY_GRACE_PERIOD_MS = 60 * 60 * 1000; // 1 hour hard safety bound
+
 export async function reconcileR2Storage(
   r2: any,
   db: any,
@@ -198,7 +201,13 @@ export async function reconcileR2Storage(
   truncated: boolean;
   cursor?: string;
 }> {
-  const safetyGracePeriodMs = options?.safetyGracePeriodMs ?? 60 * 60 * 1000;
+  // R8-A3: Hard safety bound floor. Enforce minimum 60 minutes across all production callers.
+  // In non-production testing, an explicit override can be used only if expressly specified.
+  const isProd = process.env.NODE_ENV === "production";
+  const requestedGrace = options?.safetyGracePeriodMs;
+  const safetyGracePeriodMs = isProd
+    ? Math.max(MIN_SAFETY_GRACE_PERIOD_MS, requestedGrace ?? MIN_SAFETY_GRACE_PERIOD_MS)
+    : (requestedGrace !== undefined ? requestedGrace : MIN_SAFETY_GRACE_PERIOD_MS);
   const prefix = options?.prefix ?? "users/";
   let cursor: string | undefined = undefined;
   let scannedCount = 0;

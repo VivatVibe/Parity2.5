@@ -859,22 +859,108 @@ export async function markPhotoForDeletion(
   return photo;
 }
 
+export async function claimPhotoForDeletion(
+  db: D1Database,
+  userId: number,
+  jobId: number,
+  photoId: number,
+  workerId: string,
+  leaseMinutes = 2
+): Promise<JobPhotoRecord> {
+  // R8-A2: Exclusive deletion ownership protocol.
+  // Atomically claim the photo into 'CLEANING' status with exclusive worker ownership,
+  // incremented generation token, and an active lease.
+  // Fails if the row is already locked by another cleaner holding an unexpired lease.
+  const photo = await db
+    .prepare(
+      `UPDATE job_photos 
+       SET status = 'CLEANING', 
+           cleanup_worker_id = ?,
+           cleanup_generation = COALESCE(cleanup_generation, 0) + 1,
+           cleanup_lease_expires_at = datetime('now', '+' || ? || ' minutes'),
+           slot_number = NULL
+       WHERE id = ? AND job_id = ? AND user_id = ? 
+         AND (
+           status != 'CLEANING' 
+           OR cleanup_lease_expires_at IS NULL 
+           OR cleanup_lease_expires_at < datetime('now')
+         )
+       RETURNING *`
+    )
+    .bind(workerId, leaseMinutes, photoId, jobId, userId)
+    .first<JobPhotoRecord>();
+
+  if (!photo) {
+    const existing = await db
+      .prepare(
+        "SELECT id, status, cleanup_lease_expires_at FROM job_photos WHERE id = ? AND job_id = ? AND user_id = ?"
+      )
+      .bind(photoId, jobId, userId)
+      .first<{ id: number; status: string; cleanup_lease_expires_at: string | null }>();
+
+    if (!existing) {
+      throw new Error(`Photo ID ${photoId} not found or does not belong to user ${userId}`);
+    }
+    throw new Error(
+      `Photo ID ${photoId} is currently locked by active background cleanup processing`
+    );
+  }
+  return photo;
+}
+
+export async function markPhotoSlotForCleanupRetry(
+  db: D1Database,
+  userId: number,
+  photoId: number,
+  lastError: string
+): Promise<void> {
+  // R8-A3: Durable failure recording.
+  // Preserves photo reference in PENDING_DELETE with diagnostic error so background sweeper retries R2 deletion.
+  await db
+    .prepare(
+      `UPDATE job_photos 
+       SET status = 'PENDING_DELETE', 
+           slot_number = NULL, 
+           cleanup_attempts = COALESCE(cleanup_attempts, 0) + 1,
+           last_cleanup_error = ?
+       WHERE id = ? AND user_id = ?`
+    )
+    .bind(lastError, photoId, userId)
+    .run();
+}
+
 export async function finalizePhotoDeletion(
   db: D1Database,
   userId: number,
   photoId: number,
+  workerId?: string,
   expectedGeneration?: number
 ): Promise<boolean> {
-  // P0-02 / R7-A1: Conditional finalization fencing.
-  // Strictly verifies status is PENDING_DELETE and cleanup_generation matches expected token.
-  // Ensures HTTP deletion cannot clobber a row concurrently claimed by a background sweeper.
-  let query =
-    "DELETE FROM job_photos WHERE id = ? AND user_id = ? AND status = 'PENDING_DELETE'";
+  // R8-A1 & R8-A2: Conditional finalization fencing under active exclusive lease.
+  // Strictly verifies ownership, generation token, and active lease validity.
+  let query: string;
   const params: any[] = [photoId, userId];
 
-  if (expectedGeneration !== undefined) {
-    query += " AND (cleanup_generation IS ? OR cleanup_generation = ?)";
-    params.push(expectedGeneration, expectedGeneration);
+  if (workerId) {
+    query = `DELETE FROM job_photos 
+             WHERE id = ? AND user_id = ? 
+               AND status = 'CLEANING' 
+               AND cleanup_worker_id = ? 
+               AND cleanup_lease_expires_at IS NOT NULL 
+               AND cleanup_lease_expires_at >= datetime('now')`;
+    params.push(workerId);
+    if (expectedGeneration !== undefined) {
+      query += " AND (cleanup_generation IS ? OR cleanup_generation = ?)";
+      params.push(expectedGeneration, expectedGeneration);
+    }
+  } else {
+    query = `DELETE FROM job_photos 
+             WHERE id = ? AND user_id = ? 
+               AND status = 'PENDING_DELETE'`;
+    if (expectedGeneration !== undefined) {
+      query += " AND (cleanup_generation IS ? OR cleanup_generation = ?)";
+      params.push(expectedGeneration, expectedGeneration);
+    }
   }
 
   const res = await db.prepare(query).bind(...params).run();
@@ -899,9 +985,88 @@ export async function deleteJobPhoto(
   jobId: number,
   photoId: number
 ): Promise<JobPhotoRecord> {
-  const marked = await markPhotoForDeletion(db, userId, jobId, photoId);
-  await finalizePhotoDeletion(db, userId, photoId, marked.cleanup_generation);
-  return marked;
+  const workerId = `delete-worker-${userId}-${Date.now()}`;
+  const claimed = await claimPhotoForDeletion(db, userId, jobId, photoId, workerId);
+  await finalizePhotoDeletion(db, userId, photoId, workerId, claimed.cleanup_generation);
+  return claimed;
+}
+
+export async function handlePhotoDeletionRequest(
+  db: D1Database,
+  r2: any,
+  userId: number,
+  jobId: number,
+  photoId: number,
+  customWorkerId?: string
+): Promise<{ status: number; body: { success?: boolean; deletedPhotoId?: number; error?: string } }> {
+  const workerId =
+    customWorkerId ||
+    `http-del-${userId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+  let claimedPhoto: JobPhotoRecord;
+  try {
+    claimedPhoto = await claimPhotoForDeletion(db, userId, jobId, photoId, workerId);
+  } catch (claimErr: any) {
+    const isConflict = claimErr?.message?.includes("currently locked by active background cleanup");
+    const isNotFound = claimErr?.message?.includes("not found");
+    return {
+      status: isConflict ? 409 : isNotFound ? 404 : 400,
+      body: { error: claimErr?.message || "Failed to claim photo for deletion" },
+    };
+  }
+
+  // Delete from R2 storage under verified exclusive lease
+  await deletePhoto(r2, claimedPhoto.r2_key);
+
+  // R8-A1: Finalize deletion in D1 verifying active lease and generation ownership
+  const finalized = await finalizePhotoDeletion(
+    db,
+    userId,
+    photoId,
+    workerId,
+    claimedPhoto.cleanup_generation
+  );
+
+  if (!finalized) {
+    // R8-A1: Never falsely return success if D1 finalization failed or lease expired
+    return {
+      status: 409,
+      body: { error: "Photo deletion lease expired or was preempted before finalization" },
+    };
+  }
+
+  return {
+    status: 200,
+    body: { success: true, deletedPhotoId: photoId },
+  };
+}
+
+export async function handlePhotoUploadActivationFailure(
+  db: D1Database,
+  r2: any,
+  userId: number,
+  slotId: number,
+  r2Key: string,
+  activationError: any
+): Promise<void> {
+  // R8-A3: Durable cleanup on activation failure.
+  // If R2 deletion succeeds, purge the reservation immediately via failPhotoSlot.
+  // If R2 deletion fails, preserve row as PENDING_DELETE with diagnostic error for sweeper retry.
+  let r2Deleted = false;
+  try {
+    await deletePhoto(r2, r2Key);
+    r2Deleted = true;
+  } catch (r2Err: any) {
+    await markPhotoSlotForCleanupRetry(
+      db,
+      userId,
+      slotId,
+      r2Err?.message || "R2 cleanup failed"
+    );
+  }
+  if (r2Deleted) {
+    await failPhotoSlot(db, userId, slotId);
+  }
 }
 
 export async function renewPhotoCleanupLease(
