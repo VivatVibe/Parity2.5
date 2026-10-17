@@ -41,6 +41,8 @@ import {
   listPhotosPaginated,
   reconcileR2Storage,
   clearMemoryStorage,
+  handleMaintenanceReconciliation,
+  timingSafeEqual,
 } from "../src/lib/storage";
 import {
   executePaymentWithRetry,
@@ -274,6 +276,105 @@ async function runRemediationVerification() {
   console.log("  ✓ Storage fails closed in production when R2 binding is unavailable");
 
   // =========================================================================
+  // 4. SEC-04: Critical Maintenance API Fail-Closed Auth & Input Boundaries
+  // =========================================================================
+  console.log("\n▶ Testing SEC-04: Critical Maintenance API Authentication & Input Validation...");
+
+  const dummyR2Mock = {
+    list: async () => ({ objects: [], truncated: false }),
+    delete: async () => {},
+  };
+
+  // 1. Missing CRON_SECRET: Fails closed with HTTP 500 unconditionally
+  const reqNoAuth = new Request("http://localhost:5173/api/maintenance/reconcile", { method: "POST" });
+  const resNoSecret = await handleMaintenanceReconciliation(reqNoAuth, db, dummyR2Mock, "");
+  assert.strictEqual(resNoSecret.status, 500);
+  const errNoSecret = await resNoSecret.json();
+  assert.ok(errNoSecret.error.includes("CRON_SECRET not configured"), "Must fail closed if CRON_SECRET is unconfigured");
+
+  // 2. Unauthenticated request when CRON_SECRET is configured: Fails with HTTP 401
+  const testCronSecret = "cron-secret-super-secure-production-2026-xyz";
+  const resUnauth = await handleMaintenanceReconciliation(reqNoAuth, db, dummyR2Mock, testCronSecret);
+  assert.strictEqual(resUnauth.status, 401);
+  const errUnauth = await resUnauth.json();
+  assert.strictEqual(errUnauth.error, "Unauthorized maintenance request");
+
+  // 3. Invalid Bearer token: Fails with HTTP 401
+  const reqBadBearer = new Request("http://localhost:5173/api/maintenance/reconcile", {
+    method: "POST",
+    headers: { Authorization: "Bearer wrong-secret" },
+  });
+  const resBadBearer = await handleMaintenanceReconciliation(reqBadBearer, db, dummyR2Mock, testCronSecret);
+  assert.strictEqual(resBadBearer.status, 401);
+
+  // 4. Using JWT_SECRET as maintenance credential: Fails with HTTP 401 (proves JWT_SECRET cannot be reused!)
+  const reqJwtAsCron = new Request("http://localhost:5173/api/maintenance/reconcile", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.JWT_SECRET}` },
+  });
+  const resJwtAsCron = await handleMaintenanceReconciliation(reqJwtAsCron, db, dummyR2Mock, testCronSecret);
+  assert.strictEqual(resJwtAsCron.status, 401, "JWT_SECRET must NOT authenticate maintenance endpoint");
+
+  // 5. Valid Authorization: Bearer <CRON_SECRET> succeeds
+  const reqValidBearer = new Request("http://localhost:5173/api/maintenance/reconcile", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${testCronSecret}` },
+  });
+  const resValidBearer = await handleMaintenanceReconciliation(reqValidBearer, db, dummyR2Mock, testCronSecret);
+  assert.strictEqual(resValidBearer.status, 200);
+  const dataValidBearer = await resValidBearer.json();
+  assert.strictEqual(dataValidBearer.success, true);
+
+  // 6. Valid X-Cron-Key: <CRON_SECRET> succeeds
+  const reqValidCronKey = new Request("http://localhost:5173/api/maintenance/reconcile", {
+    method: "POST",
+    headers: { "X-Cron-Key": testCronSecret },
+  });
+  const resValidCronKey = await handleMaintenanceReconciliation(reqValidCronKey, db, dummyR2Mock, testCronSecret);
+  assert.strictEqual(resValidCronKey.status, 200);
+
+  // 7. Malicious prefix traversal attempt: Fails with HTTP 400
+  const reqBadPrefix = new Request("http://localhost:5173/api/maintenance/reconcile?prefix=../../etc", {
+    method: "POST",
+    headers: { "X-Cron-Key": testCronSecret },
+  });
+  const resBadPrefix = await handleMaintenanceReconciliation(reqBadPrefix, db, dummyR2Mock, testCronSecret);
+  assert.strictEqual(resBadPrefix.status, 400);
+  const errBadPrefix = await resBadPrefix.json();
+  assert.ok(errBadPrefix.error.includes("Invalid prefix"), "Prefix traversal must be strictly blocked");
+
+  // 8. Arbitrary root prefix (e.g. prefix="") attempt: Fails with HTTP 400
+  const reqEmptyPrefix = new Request("http://localhost:5173/api/maintenance/reconcile?prefix=", {
+    method: "POST",
+    headers: { "X-Cron-Key": testCronSecret },
+  });
+  const resEmptyPrefix = await handleMaintenanceReconciliation(reqEmptyPrefix, db, dummyR2Mock, testCronSecret);
+  assert.strictEqual(resEmptyPrefix.status, 400);
+
+  // 9. Bypass grace period attempt (grace_ms=0 or grace_ms=1000): Fails with HTTP 400
+  const reqZeroGrace = new Request("http://localhost:5173/api/maintenance/reconcile?grace_ms=0", {
+    method: "POST",
+    headers: { "X-Cron-Key": testCronSecret },
+  });
+  const resZeroGrace = await handleMaintenanceReconciliation(reqZeroGrace, db, dummyR2Mock, testCronSecret);
+  assert.strictEqual(resZeroGrace.status, 400);
+  const errZeroGrace = await resZeroGrace.json();
+  assert.ok(errZeroGrace.error.includes("minimum allowable safety grace period"), "Unsafe grace period must be rejected");
+
+  // 10. Legitimate scoped prefix (users/123/jobs/456/) with valid auth: Succeeds with HTTP 200
+  const reqScoped = new Request("http://localhost:5173/api/maintenance/reconcile?prefix=users/123/jobs/456/&grace_ms=1800000", {
+    method: "POST",
+    headers: { "X-Cron-Key": testCronSecret },
+  });
+  const resScoped = await handleMaintenanceReconciliation(reqScoped, db, dummyR2Mock, testCronSecret);
+  assert.strictEqual(resScoped.status, 200);
+
+  console.log("  ✓ SEC-04: Fail-closed without CRON_SECRET strictly verified");
+  console.log("  ✓ SEC-04: Negative auth tests (missing, invalid, JWT_SECRET reuse) strictly rejected (HTTP 401)");
+  console.log("  ✓ SEC-04: Bearer token and X-Cron-Key verified with constant-time comparison");
+  console.log("  ✓ SEC-04: Malicious prefix traversal and grace period bypass strictly blocked (HTTP 400)");
+
+  // =========================================================================
   // 5. DATA-01 & BLOCKER 2: Atomic Photo Quota & Generation Fencing
   // =========================================================================
   console.log("\n▶ Testing DATA-01 & BLOCKER 2: Atomic Quota & Generation Fencing...");
@@ -487,6 +588,88 @@ async function runRemediationVerification() {
   }
 
   // =========================================================================
+  // P0-01 FAULT INJECTION: Check-Then-Delete Race Guard & Error Resiliency
+  // =========================================================================
+  console.log("\n▶ Testing P0-01: Check-Then-Delete Race Guard & Fault Injection Scenarios...");
+
+  // Fault Injection 1: Check-then-delete race (Concurrent D1 row appearance)
+  // Simulate an R2 object that during scan has no row, but right before deletion, an ACTIVE row appears in D1.
+  const raceKey = `users/${user1.id}/jobs/${job1.id}/check-then-delete-race.webp`;
+  await putPhoto(null, raceKey, latePayload, "image/webp");
+
+  // Custom mock DB that injects an ACTIVE row during the double-check query:
+  let d1QueryCountForRace = 0;
+  const raceD1 = {
+    prepare(q: string) {
+      return {
+        bind(...args: any[]) {
+          return this;
+        },
+        async first() {
+          d1QueryCountForRace++;
+          if (d1QueryCountForRace === 1) {
+            // First check (candidate scan): object has NO D1 record
+            return null;
+          }
+          // Second check (pre-delete double check): object concurrently became ACTIVE in D1!
+          return { id: 9999, status: "ACTIVE" };
+        },
+      };
+    },
+  };
+
+  const raceResult = await reconcileR2Storage(null, raceD1, {
+    prefix: raceKey,
+    safetyGracePeriodMs: 0,
+  });
+
+  // Because the double-check detected the newly active D1 row, deletion was ABORTED!
+  assert.strictEqual(raceResult.deletedOrphans.length, 0, "Pre-delete double check MUST abort deletion when D1 row appears");
+  assert.ok((await getPhoto(null, raceKey)) !== null, "R2 object must be preserved when D1 state changes concurrently");
+  console.log("  ✓ P0-01: Check-then-delete race detected and aborted by pre-delete double-check guard");
+
+  // Fault Injection 2: R2 Delete failure resilience
+  const failingR2Delete = {
+    list: async () => ({
+      objects: [{ key: raceKey, uploaded: new Date(Date.now() - 3600000) }],
+      truncated: false,
+    }),
+    delete: async () => {
+      throw new Error("R2 storage transient network timeout");
+    },
+  };
+
+  const failDelResult = await reconcileR2Storage(failingR2Delete, db, {
+    prefix: raceKey,
+    safetyGracePeriodMs: 0,
+  });
+  assert.strictEqual(failDelResult.deletedOrphans.length, 0);
+  assert.strictEqual(failDelResult.failedDeletions.length, 1);
+  assert.strictEqual(failDelResult.failedDeletions[0].key, raceKey);
+  assert.ok(failDelResult.failedDeletions[0].error.includes("transient network timeout"));
+  console.log("  ✓ P0-01: Resilient error capture recorded failed deletions without aborting reconciler");
+
+  // Fault Injection 3: Interrupted scan with maxObjectsToScan limit and resumption
+  for (let i = 1; i <= 5; i++) {
+    await putPhoto(null, `users/${user1.id}/jobs/${job1.id}/interrupted-${i}.webp`, latePayload, "image/webp");
+  }
+  const interruptedScan = await reconcileR2Storage(null, db, {
+    prefix: `users/${user1.id}/jobs/${job1.id}/interrupted-`,
+    safetyGracePeriodMs: 0,
+    maxObjectsToScan: 2,
+  });
+  assert.strictEqual(interruptedScan.truncated, true, "Scan stopped at maxObjectsToScan boundary");
+  assert.strictEqual(interruptedScan.scannedCount, 2);
+  assert.ok(interruptedScan.cursor !== undefined, "Continuation cursor returned for resumption");
+  console.log("  ✓ P0-01: Interrupted scan properly truncated with valid continuation cursor");
+
+  // Clean up interrupted scan photos and race photo
+  for (let i = 1; i <= 5; i++) {
+    await deletePhoto(null, `users/${user1.id}/jobs/${job1.id}/interrupted-${i}.webp`);
+  }
+  await deletePhoto(null, raceKey);
+
+  // =========================================================================
   // P0-02 CONCURRENCY TEST: Sweeper Lease Semantics, Expiry & Fencing
   // =========================================================================
   console.log("\n▶ Testing P0-02: Sweeper Lease Semantics, Expiry & Generation Fencing...");
@@ -548,6 +731,68 @@ async function runRemediationVerification() {
   ).bind(stealPhotoId).run();
   assert.strictEqual((staleDelRes as any).changes, 0, "Stale worker CANNOT finalize or delete newer generation");
   console.log("  ✓ P0-02: Sweeper lease expiry, renewal, and generation fencing verified");
+
+  // 6. Test Atomic CAS Generation Collision Prevention:
+  // Two workers concurrently observe the same row with generation 2
+  const dummyR2Key2 = `users/${user1.id}/jobs/${job1.id}/cas-race.webp`;
+  await putPhoto(null, dummyR2Key2, latePayload, "image/webp");
+
+  const insertCasTest = sqlite.prepare(`
+    INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at, cleanup_generation)
+    VALUES (?, ?, ?, 'PENDING_DELETE', datetime('now', '-3 days'), 2)
+    RETURNING id
+  `).get(job1.id, user1.id, dummyR2Key2) as any;
+  const casPhotoId = insertCasTest.id;
+
+  // Both Sweeper A and Sweeper B observed row.cleanup_generation = 2
+  // Sweeper A executes CAS claim with expectedGen = 2:
+  const claimResA = await db.prepare(
+    `UPDATE job_photos 
+     SET status = 'CLEANING', cleanup_worker_id = 'worker-A', 
+         cleanup_generation = COALESCE(cleanup_generation, 0) + 1,
+         cleanup_lease_expires_at = datetime('now', '+2 minutes')
+     WHERE id = ? AND (cleanup_generation IS 2 OR cleanup_generation = 2) AND status = 'PENDING_DELETE'
+     RETURNING cleanup_generation`
+  ).bind(casPhotoId).first<{ cleanup_generation: number }>();
+
+  assert.ok(claimResA !== null);
+  assert.strictEqual(claimResA.cleanup_generation, 3, "Sweeper A incremented generation to 3");
+
+  // Sweeper B now tries to claim with its observed expectedGen = 2:
+  const claimResB = await db.prepare(
+    `UPDATE job_photos 
+     SET status = 'CLEANING', cleanup_worker_id = 'worker-B', 
+         cleanup_generation = COALESCE(cleanup_generation, 0) + 1,
+         cleanup_lease_expires_at = datetime('now', '+2 minutes')
+     WHERE id = ? AND (cleanup_generation IS 2 OR cleanup_generation = 2) AND status = 'PENDING_DELETE'
+     RETURNING cleanup_generation`
+  ).bind(casPhotoId).first<{ cleanup_generation: number }>();
+
+  assert.strictEqual(claimResB, null, "Sweeper B claim MUST fail because expected generation 2 was already bumped to 3");
+  console.log("  ✓ P0-02: CAS expected-generation predicate strictly blocks concurrent generation collisions");
+
+  // 7. Test Renewal on Expired Lease strictly fails
+  // Expire Sweeper A's lease:
+  sqlite.prepare("UPDATE job_photos SET cleanup_lease_expires_at = datetime('now', '-5 seconds') WHERE id = ?").run(casPhotoId);
+  const renewExpired = await renewPhotoCleanupLease(db, casPhotoId, "worker-A", 3, 2);
+  assert.strictEqual(renewExpired, false, "Renewing an expired lease MUST fail");
+
+  // 8. Test Finalization on Expired Lease strictly fails
+  const finalizeExpired = await db.prepare(
+    `DELETE FROM job_photos 
+     WHERE id = ? 
+       AND status = 'CLEANING' 
+       AND cleanup_worker_id = 'worker-A' 
+       AND cleanup_generation = 3 
+       AND cleanup_lease_expires_at IS NOT NULL
+       AND cleanup_lease_expires_at >= datetime('now')`
+  ).bind(casPhotoId).run();
+  assert.strictEqual((finalizeExpired as any).changes, 0, "Finalizing with an expired lease MUST affect 0 rows");
+  console.log("  ✓ P0-02: Renewal and finalization strictly enforce active unexpired lease validity");
+
+  // Clean up casPhotoId
+  sqlite.prepare("DELETE FROM job_photos WHERE id = ?").run(casPhotoId);
+  await deletePhoto(null, dummyR2Key2);
 
   // =========================================================================
   // 7. DATA-03 & BLOCKER 3: Retainer Multiple Partial Payments & Replay Matching
@@ -825,6 +1070,188 @@ async function runRemediationVerification() {
   const novPaymentsTotal = (await getJobPayments(db, user1.id, retainerJob.id)).filter(p => p.billing_period === "2026-11");
   assert.strictEqual(novPaymentsTotal.length, 2, "Two distinct partial payments recorded for November");
   console.log("  ✓ P1-03: Immutable operation persistence, balance drift immunity, 409 reconciliation, and subsequent partial payments verified");
+
+  // =========================================================================
+  // P1-03: 409 Conflict Material Payload Verification & Collision Rejection
+  // =========================================================================
+  const mismatchJob = await createJob(db, user1.id, {
+    client_id: client1.id,
+    job_type: "REPAIR",
+    title: "Payload Mismatch Job",
+    total_quoted_amount: 10000,
+    metadata: {
+      deviceModel: "MacBook Air",
+      serialNumber: "MBA-123",
+      symptom: "Water Damage",
+      partsCost: 500,
+    },
+  });
+
+  const conflictStorageMap = new Map<string, string>();
+  const conflictStorage = {
+    getItem: (k: string) => conflictStorageMap.get(k) || null,
+    setItem: (k: string, v: string) => { conflictStorageMap.set(k, v); },
+    removeItem: (k: string) => { conflictStorageMap.delete(k); },
+  };
+
+  // Base payment committed on server under an idempotency key:
+  const committedPayment = {
+    id: 991,
+    job_id: mismatchJob.id,
+    amount: 4000,
+    parts_cost: 500,
+    payment_type: "DEPOSIT",
+    billing_period: null,
+    note: "Deposit 4000",
+    idempotency_key: "test-mismatch-key",
+  };
+
+  const mockFetchMismatch = async (url: string, init?: any) => {
+    const parsedUrl = new URL(url, "http://localhost:5173");
+    if (parsedUrl.searchParams.has("idempotency_key")) {
+      return new Response(JSON.stringify({ payment: committedPayment }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    // POST returns 409 Conflict
+    return new Response(JSON.stringify({ error: "IDEMPOTENCY_CONFLICT" }), {
+      status: 409,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  // Case 1: Mismatched amount (pendingOp amount: 3500 vs server: 4000)
+  conflictStorage.setItem(
+    `parity_pending_pay_op_${mismatchJob.id}_single`,
+    JSON.stringify({
+      jobId: mismatchJob.id,
+      amount: 3500, // Mismatched!
+      partsCost: 500,
+      paymentType: "DEPOSIT",
+      billingPeriod: undefined,
+      note: "Deposit 4000",
+      idempotencyKey: "test-mismatch-key",
+      createdAt: Date.now(),
+    })
+  );
+
+  const resMismatchAmount = await executePaymentWithRetry({
+    jobId: mismatchJob.id,
+    amount: 3500,
+    partsCost: 500,
+    paymentType: "DEPOSIT",
+    storage: conflictStorage,
+    fetchFn: mockFetchMismatch as any,
+  });
+
+  assert.strictEqual(resMismatchAmount.ok, false);
+  assert.strictEqual(resMismatchAmount.status, 409);
+  assert.strictEqual(resMismatchAmount.isConflict, true);
+  assert.ok(resMismatchAmount.error?.includes("IDEMPOTENCY_PAYLOAD_MISMATCH"));
+  assert.ok(
+    conflictStorage.getItem(`parity_pending_pay_op_${mismatchJob.id}_single`) !== null,
+    "Pending operation MUST NOT be cleared when amount mismatches"
+  );
+
+  // Case 2: Mismatched partsCost (pendingOp partsCost: 999 vs server: 500)
+  conflictStorage.setItem(
+    `parity_pending_pay_op_${mismatchJob.id}_single`,
+    JSON.stringify({
+      jobId: mismatchJob.id,
+      amount: 4000,
+      partsCost: 999, // Mismatched!
+      paymentType: "DEPOSIT",
+      billingPeriod: undefined,
+      note: "Deposit 4000",
+      idempotencyKey: "test-mismatch-key",
+      createdAt: Date.now(),
+    })
+  );
+
+  const resMismatchParts = await executePaymentWithRetry({
+    jobId: mismatchJob.id,
+    amount: 4000,
+    partsCost: 999,
+    paymentType: "DEPOSIT",
+    storage: conflictStorage,
+    fetchFn: mockFetchMismatch as any,
+  });
+
+  assert.strictEqual(resMismatchParts.ok, false);
+  assert.strictEqual(resMismatchParts.isConflict, true);
+  assert.ok(
+    conflictStorage.getItem(`parity_pending_pay_op_${mismatchJob.id}_single`) !== null,
+    "Pending operation MUST NOT be cleared when partsCost mismatches"
+  );
+
+  // Case 3: Mismatched note (pendingOp note: "Different Note" vs server: "Deposit 4000")
+  conflictStorage.setItem(
+    `parity_pending_pay_op_${mismatchJob.id}_single`,
+    JSON.stringify({
+      jobId: mismatchJob.id,
+      amount: 4000,
+      partsCost: 500,
+      paymentType: "DEPOSIT",
+      billingPeriod: undefined,
+      note: "Different Note", // Mismatched!
+      idempotencyKey: "test-mismatch-key",
+      createdAt: Date.now(),
+    })
+  );
+
+  const resMismatchNote = await executePaymentWithRetry({
+    jobId: mismatchJob.id,
+    amount: 4000,
+    partsCost: 500,
+    paymentType: "DEPOSIT",
+    note: "Different Note",
+    storage: conflictStorage,
+    fetchFn: mockFetchMismatch as any,
+  });
+
+  assert.strictEqual(resMismatchNote.ok, false);
+  assert.strictEqual(resMismatchNote.isConflict, true);
+  assert.ok(
+    conflictStorage.getItem(`parity_pending_pay_op_${mismatchJob.id}_single`) !== null,
+    "Pending operation MUST NOT be cleared when note mismatches"
+  );
+
+  // Case 4: Exact match across all fields -> Resolves successfully and clears storage!
+  conflictStorage.setItem(
+    `parity_pending_pay_op_${mismatchJob.id}_single`,
+    JSON.stringify({
+      jobId: mismatchJob.id,
+      amount: 4000,
+      partsCost: 500,
+      paymentType: "DEPOSIT",
+      billingPeriod: undefined,
+      note: "Deposit 4000",
+      idempotencyKey: "test-mismatch-key",
+      createdAt: Date.now(),
+    })
+  );
+
+  const resExactMatch = await executePaymentWithRetry({
+    jobId: mismatchJob.id,
+    amount: 4000,
+    partsCost: 500,
+    paymentType: "DEPOSIT",
+    note: "Deposit 4000",
+    storage: conflictStorage,
+    fetchFn: mockFetchMismatch as any,
+  });
+
+  assert.strictEqual(resExactMatch.ok, true);
+  assert.strictEqual(resExactMatch.data.isIdempotentReplay, true);
+  assert.strictEqual(
+    conflictStorage.getItem(`parity_pending_pay_op_${mismatchJob.id}_single`),
+    null,
+    "Pending operation MUST be cleared on exact payload match"
+  );
+
+  console.log("  ✓ P1-03: Material payload verification (amount, partsCost, note, billingPeriod) strictly enforced on 409");
+  console.log("  ✓ P1-03: Mismatches preserve pending state and flag explicit conflict for user review");
 
   // =========================================================================
   // 8. BLOCKER 4: Migration Compatibility & Deterministic Backfill

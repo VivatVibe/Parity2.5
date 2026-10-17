@@ -66,6 +66,7 @@ export async function executePaymentWithRetry(options: PaymentExecutionOptions):
   error?: string;
   isConflict?: boolean;
   operation: PersistedPaymentOperation;
+  serverPayment?: any;
 }> {
   const {
     jobId,
@@ -157,17 +158,49 @@ export async function executePaymentWithRetry(options: PaymentExecutionOptions):
         );
         if (checkRes.ok) {
           const checkData = await checkRes.json();
-          if (checkData.payment) {
-            // Already committed on server! Safely resolve and clear storage.
-            if (storage) {
-              storage.removeItem(storageKey);
+          const p = checkData.payment;
+          if (p) {
+            // P1-03: Strictly compare all material fields: jobId, amount, partsCost, paymentType, billingPeriod, and note.
+            // Do NOT clear pending state or accept result if any material field differs.
+            const serverJobId = Number(p.job_id ?? p.jobId);
+            const serverAmount = Number(p.amount);
+            const serverPartsCost = Number(p.parts_cost ?? p.partsCost ?? 0);
+            const serverPaymentType = p.payment_type ?? p.paymentType;
+            const serverBillingPeriod = (p.billing_period ?? p.billingPeriod ?? null) || null;
+            const serverNote = (p.note ?? null) || null;
+
+            const isMatch =
+              serverJobId === opToExecute.jobId &&
+              serverAmount === opToExecute.amount &&
+              serverPartsCost === (opToExecute.partsCost || 0) &&
+              serverPaymentType === opToExecute.paymentType &&
+              serverBillingPeriod === (opToExecute.billingPeriod || null) &&
+              serverNote === (opToExecute.note || null);
+
+            if (isMatch) {
+              // Confirmed exact match! Safely resolve and clear storage.
+              if (storage) {
+                storage.removeItem(storageKey);
+              }
+              return {
+                ok: true,
+                status: 200,
+                data: { success: true, payment: p, isIdempotentReplay: true },
+                operation: opToExecute,
+              };
+            } else {
+              // Material fields differ! Key reused with conflicting payload.
+              // Do NOT clear pending state; return an explicit conflict requiring user review.
+              return {
+                ok: false,
+                status: 409,
+                isConflict: true,
+                error:
+                  "IDEMPOTENCY_PAYLOAD_MISMATCH: Server payment record differs from pending operation payload",
+                operation: opToExecute,
+                serverPayment: p,
+              };
             }
-            return {
-              ok: true,
-              status: 200,
-              data: { success: true, payment: checkData.payment, isIdempotentReplay: true },
-              operation: opToExecute,
-            };
           }
         }
       } catch {

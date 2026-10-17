@@ -7,6 +7,9 @@ export default defineConfig({
     compatibilityDate: "2026-10-17",
     compatibilityFlags: ["nodejs_compat"],
     assets: { notFoundHandling: "none" },
+    triggers: [
+      { type: "scheduled", schedule: "0 3 * * *" }, // Daily cron trigger at 03:00 UTC
+    ],
     env: {
       ASSETS: bindings.assets(),
       DB: bindings.d1({ name: "parity-db", id: "00000000-0000-0000-0000-000000000000" }),

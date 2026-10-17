@@ -869,11 +869,17 @@ export async function renewPhotoCleanupLease(
   generation: number,
   extensionMinutes = 2
 ): Promise<boolean> {
+  // P0-02: Enforce lease ownership, exact generation, AND that lease is still unexpired
   const res = await db
     .prepare(
       `UPDATE job_photos 
        SET cleanup_lease_expires_at = datetime('now', '+' || ? || ' minutes')
-       WHERE id = ? AND status = 'CLEANING' AND cleanup_worker_id = ? AND cleanup_generation = ?`
+       WHERE id = ? 
+         AND status = 'CLEANING' 
+         AND cleanup_worker_id = ? 
+         AND cleanup_generation = ?
+         AND cleanup_lease_expires_at IS NOT NULL
+         AND cleanup_lease_expires_at >= datetime('now')`
     )
     .bind(extensionMinutes, photoId, workerId, generation)
     .run();
@@ -928,34 +934,39 @@ export async function cleanupOrphanedPhotos(
   let skippedCount = 0;
 
   for (const row of results || []) {
-    const targetGen = (row.cleanup_generation || 0) + 1;
+    const expectedGen = row.cleanup_generation ?? 0;
 
-    // 2. Atomic CAS state transition to 'CLEANING' with independent lease expiry timestamp (now + 2m)
-    // and generation increment. Fences out stale and concurrent sweepers safely.
+    // 2. P0-02 Atomic CAS state transition to 'CLEANING':
+    // - Enforce expected cleanup_generation in predicate
+    // - Atomically increment generation in SQL: COALESCE(cleanup_generation, 0) + 1
+    // - Retrieve the new generation directly via RETURNING
     const claimRes = await db
       .prepare(
         `UPDATE job_photos 
          SET status = 'CLEANING', 
              cleanup_worker_id = ?, 
-             cleanup_generation = ?,
+             cleanup_generation = COALESCE(cleanup_generation, 0) + 1,
              cleanup_lease_expires_at = datetime('now', '+2 minutes'),
              slot_number = NULL
          WHERE id = ? 
+           AND (cleanup_generation IS ? OR cleanup_generation = ?)
            AND (
              status = 'PENDING_DELETE' 
              OR (status = 'RESERVED' AND created_at < datetime('now', '-5 minutes'))
              OR (status = 'CLEANING' AND cleanup_lease_expires_at IS NOT NULL AND cleanup_lease_expires_at < datetime('now'))
-           )`
+           )
+         RETURNING cleanup_generation`
       )
-      .bind(currentWorkerId, targetGen, row.id)
-      .run();
+      .bind(currentWorkerId, row.id, row.cleanup_generation ?? null, expectedGen)
+      .first<{ cleanup_generation: number }>();
 
-    const affected = (claimRes as any)?.changes ?? (claimRes as any)?.meta?.changes ?? 0;
-    if (affected === 0) {
-      // Row was claimed by another worker, updated, or lease was active. Skip!
+    if (!claimRes || claimRes.cleanup_generation === undefined || claimRes.cleanup_generation === null) {
+      // Row was claimed concurrently, generation diverged, or lease was renewed. Skip!
       skippedCount++;
       continue;
     }
+
+    const targetGen = claimRes.cleanup_generation;
 
     // 3. Perform external R2 deletion under verified exclusive lease
     let r2Success = false;
@@ -969,15 +980,19 @@ export async function cleanupOrphanedPhotos(
     }
 
     if (r2Success) {
-      // 4a. Conditional D1 row deletion: verify ownership AND generation before purging.
-      // Stale workers whose lease expired cannot delete or overwrite newer state!
+      // 4a. Conditional D1 row deletion: verify ownership, generation, AND active lease validity before purging.
+      // Note: D1 fencing does not physically cancel or abort in-flight network requests to R2;
+      // rather, it fences the D1 transaction boundary so that a delayed or stale worker cannot finalize or commit
+      // deletions if its lease expired or was taken over by a newer worker.
       const delRes = await db
         .prepare(
           `DELETE FROM job_photos 
            WHERE id = ? 
              AND status = 'CLEANING' 
              AND cleanup_worker_id = ?
-             AND cleanup_generation = ?`
+             AND cleanup_generation = ?
+             AND cleanup_lease_expires_at IS NOT NULL
+             AND cleanup_lease_expires_at >= datetime('now')`
         )
         .bind(row.id, currentWorkerId, targetGen)
         .run();
@@ -986,11 +1001,11 @@ export async function cleanupOrphanedPhotos(
       if (delAffected > 0) {
         cleanedCount++;
       } else {
-        // Lease was stolen by a newer worker while R2 delete was running.
+        // Lease was stolen by a newer worker or expired while R2 delete was running.
         skippedCount++;
       }
     } else {
-      // 4b. Revert to PENDING_DELETE with diagnostic error and clear lease expiry
+      // 4b. Revert to PENDING_DELETE with diagnostic error, fenced by ownership, generation, and active lease.
       failedCount++;
       await db
         .prepare(
@@ -1003,7 +1018,9 @@ export async function cleanupOrphanedPhotos(
            WHERE id = ? 
              AND status = 'CLEANING' 
              AND cleanup_worker_id = ?
-             AND cleanup_generation = ?`
+             AND cleanup_generation = ?
+             AND cleanup_lease_expires_at IS NOT NULL
+             AND cleanup_lease_expires_at >= datetime('now')`
         )
         .bind(r2Error, row.id, currentWorkerId, targetGen)
         .run();
