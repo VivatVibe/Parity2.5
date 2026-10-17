@@ -9,7 +9,7 @@ export default defineConfig({
     assets: { notFoundHandling: "none" },
     env: {
       ASSETS: bindings.assets(),
-      DB: bindings.d1({ name: "parity-db" }),
+      DB: bindings.d1({ name: "parity-db", id: "00000000-0000-0000-0000-000000000000" }),
       PHOTOS: bindings.r2({ name: "parity-photos" }),
     },
   }),

@@ -23,8 +23,10 @@
 		"@vitejs/plugin-rsc": "latest",
 		"cf": "^1.0.0-beta.18",
 		"tailwindcss": "latest",
+		"tsx": "^4.23.15",
 		"typescript": "latest",
-		"vite": "8.3.0"
+		"vite": "8.3.0",
+		"wrangler": "^4.151.1"
 	},
 	"type": "module",
 	"scripts": {
@@ -33,6 +35,7 @@
 		"start": "vite preview",
 		"deploy": "vinext-cloudflare deploy",
 		"preview": "npm run build && npm run start --",
-		"cf-typegen": "cf workers types"
+		"cf-typegen": "cf workers types",
+		"test:ticket1": "tsx tests/verify_ticket1.ts"
 	}
 }
