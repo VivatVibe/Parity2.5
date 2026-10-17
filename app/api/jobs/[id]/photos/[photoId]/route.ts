@@ -71,18 +71,22 @@ export async function DELETE(
       return NextResponse.json({ error: "Invalid ID parameters" }, { status: 400 });
     }
 
-    // DATA-02: Mark as PENDING_DELETE first so we never lose the reference on R2 crash
+    // DATA-02 / P0-02 / R7-A1: Mark as PENDING_DELETE with atomic generation fencing.
+    // Fails with conflict if currently locked by an active background cleanup lease.
     const markedPhoto = await markPhotoForDeletion(env.DB, session.userId, jobId, photoId);
 
     // Delete from R2 storage
     const r2Binding = (env as any).PHOTOS || (env as any).R2;
     await deletePhoto(r2Binding, markedPhoto.r2_key);
 
-    // Finalize deletion in D1
-    await finalizePhotoDeletion(env.DB, session.userId, photoId);
+    // Finalize deletion in D1 with generation fencing
+    await finalizePhotoDeletion(env.DB, session.userId, photoId, markedPhoto.cleanup_generation);
 
     return NextResponse.json({ success: true, deletedPhotoId: photoId });
   } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 400 });
+    const isConflict = error?.message?.includes("currently locked by active background cleanup");
+    const isNotFound = error?.message?.includes("not found");
+    const status = isConflict ? 409 : isNotFound ? 404 : 400;
+    return NextResponse.json({ error: error.message }, { status });
   }
 }

@@ -3,14 +3,23 @@ import { cleanupOrphanedPhotos } from "./lib/db";
 
 // Lazy-load or fallback fetch handler for hybrid Node testing and Vite bundling
 let fetchHandler: any = null;
-async function resolveFetchHandler() {
+export function resetFetchHandlerForTesting() {
+  fetchHandler = null;
+}
+export async function resolveFetchHandler() {
   if (!fetchHandler) {
     try {
       // In Vite/Cloudflare build, 'vinext/server/fetch-handler' is resolved by the Vite plugin
       const mod = await import("vinext/server/fetch-handler");
       fetchHandler = mod.default || mod;
-    } catch {
-      // Fallback in Node test harness
+    } catch (err) {
+      // R7-B1: Fail closed in production. Never return a synthetic success response in production.
+      if (process.env.NODE_ENV === "production") {
+        throw new Error(
+          "Production fetch handler initialization failed: cannot load 'vinext/server/fetch-handler'"
+        );
+      }
+      // Fallback in Node test harness / development
       fetchHandler = async (req: Request) => new Response("OK", { status: 200 });
     }
   }
@@ -26,27 +35,25 @@ export async function handleScheduledEvent(
   env: any,
   ctx?: any
 ): Promise<{ sweeper: any; reconciler: any }> {
-  const r2Binding = env?.PHOTOS || env?.R2;
-  let sweeperResult = { cleanedCount: 0, failedCount: 0, skippedCount: 0 };
-  let reconcilerResult = {
-    scannedCount: 0,
-    deletedOrphans: [] as string[],
-    failedDeletions: [] as { key: string; error: string }[],
-    truncated: false,
-  };
-
-  if (env?.DB) {
-    // 1. Sweeper execution: Purges expired reservations (>5m), PENDING_DELETE rows, and stale leases
-    sweeperResult = await cleanupOrphanedPhotos(env.DB, r2Binding);
-
-    // 2. Cross-service storage reconciler: Purges confirmed unreferenced R2 objects older than grace period
-    if (r2Binding) {
-      reconcilerResult = await reconcileR2Storage(r2Binding, env.DB, {
-        prefix: "users/",
-        safetyGracePeriodMs: 60 * 60 * 1000, // 1 hour safety grace period
-      });
-    }
+  // R7-A3: Fail-closed runtime verification.
+  // In Cloudflare Workers, throwing from a scheduled event notifies the runtime of a failed cron job.
+  if (!env?.DB) {
+    throw new Error("Scheduled maintenance failed: D1 database binding 'DB' is missing");
   }
+
+  const r2Binding = env?.PHOTOS || env?.R2;
+  if (!r2Binding) {
+    throw new Error("Scheduled maintenance failed: R2 storage binding ('PHOTOS' or 'R2') is missing");
+  }
+
+  // 1. Sweeper execution: Purges expired reservations (>5m), PENDING_DELETE rows, and stale leases
+  const sweeperResult = await cleanupOrphanedPhotos(env.DB, r2Binding);
+
+  // 2. Cross-service storage reconciler: Purges confirmed unreferenced R2 objects older than grace period
+  const reconcilerResult = await reconcileR2Storage(r2Binding, env.DB, {
+    prefix: "users/",
+    safetyGracePeriodMs: 60 * 60 * 1000, // 1 hour safety grace period
+  });
 
   return { sweeper: sweeperResult, reconciler: reconcilerResult };
 }

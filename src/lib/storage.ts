@@ -349,8 +349,8 @@ export async function handleMaintenanceReconciliation(
       prefix = sanitized;
     }
 
-    // Enforce minimum safety grace period of at least 15 minutes (default: 1 hour)
-    const MIN_GRACE_PERIOD_MS = 15 * 60 * 1000; // 15 minutes minimum threshold
+    // P0-01 / R7-A2: Enforce minimum safety grace period of at least 60 minutes (1 hour)
+    const MIN_GRACE_PERIOD_MS = 60 * 60 * 1000; // 60 minutes strictly enforced minimum threshold
     const DEFAULT_GRACE_PERIOD_MS = 60 * 60 * 1000; // 1 hour default
     const requestedGraceMs = url.searchParams.get("grace_ms");
     let safetyGracePeriodMs = DEFAULT_GRACE_PERIOD_MS;
@@ -358,7 +358,7 @@ export async function handleMaintenanceReconciliation(
       const parsed = Number(requestedGraceMs);
       if (isNaN(parsed) || parsed < MIN_GRACE_PERIOD_MS) {
         return Response.json(
-          { error: `Invalid grace_ms: minimum allowable safety grace period is ${MIN_GRACE_PERIOD_MS}ms (15m)` },
+          { error: `Invalid grace_ms: minimum allowable safety grace period is ${MIN_GRACE_PERIOD_MS}ms (60m)` },
           { status: 400 }
         );
       }

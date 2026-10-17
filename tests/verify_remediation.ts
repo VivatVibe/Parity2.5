@@ -50,7 +50,11 @@ import {
   getPendingPaymentOperation,
   cancelPendingPaymentOperation,
 } from "../src/lib/payment-client";
-import worker, { handleScheduledEvent } from "../src/worker";
+import worker, {
+  handleScheduledEvent,
+  resolveFetchHandler,
+  resetFetchHandlerForTesting,
+} from "../src/worker";
 
 /**
  * Lightweight in-memory D1 mock with SQL query counting
@@ -361,10 +365,18 @@ async function runRemediationVerification() {
   const resZeroGrace = await handleMaintenanceReconciliation(reqZeroGrace, db, dummyR2Mock, testCronSecret);
   assert.strictEqual(resZeroGrace.status, 400);
   const errZeroGrace = await resZeroGrace.json();
-  assert.ok(errZeroGrace.error.includes("minimum allowable safety grace period"), "Unsafe grace period must be rejected");
+  assert.ok(errZeroGrace.error.includes("minimum allowable safety grace period is 3600000ms (60m)"), "Unsafe grace period must be rejected");
 
-  // 10. Legitimate scoped prefix (users/123/jobs/456/) with valid auth: Succeeds with HTTP 200
-  const reqScoped = new Request("http://localhost:5173/api/maintenance/reconcile?prefix=users/123/jobs/456/&grace_ms=1800000", {
+  // 9b. R7-A2: Sub-60-minute grace period attempt (e.g. 15m or 30m): Strictly rejected with HTTP 400
+  const reqSubHourGrace = new Request("http://localhost:5173/api/maintenance/reconcile?grace_ms=1800000", {
+    method: "POST",
+    headers: { "X-Cron-Key": testCronSecret },
+  });
+  const resSubHourGrace = await handleMaintenanceReconciliation(reqSubHourGrace, db, dummyR2Mock, testCronSecret);
+  assert.strictEqual(resSubHourGrace.status, 400);
+
+  // 10. Legitimate scoped prefix (users/123/jobs/456/) with valid auth (>= 60m grace): Succeeds with HTTP 200
+  const reqScoped = new Request("http://localhost:5173/api/maintenance/reconcile?prefix=users/123/jobs/456/&grace_ms=3600000", {
     method: "POST",
     headers: { "X-Cron-Key": testCronSecret },
   });
@@ -1561,6 +1573,98 @@ async function runRemediationVerification() {
   assert.strictEqual(remainingInD1.cnt, 0, "All 12 items purged from D1");
   console.log("  ✓ Scenario 6: 4 concurrent overlapping workers achieve exact-once item processing without collision");
 
+  // Scenario 7 (R7-T2 / R7-A1): Deterministic interleaving: HTTP photo deletion vs Background Sweeper contention
+  // Subcase 7a: Active Sweeper Lease strictly blocks HTTP photo deletion (HTTP 409 Conflict)
+  const row7a = sqlite.prepare(`
+    INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at, cleanup_worker_id, cleanup_generation, cleanup_lease_expires_at)
+    VALUES (?, ?, ?, 'CLEANING', datetime('now'), 'active-sweeper', 1, datetime('now', '+2 minutes'))
+    RETURNING id, r2_key
+  `).get(testJob.id, user1.id, `users/${user1.id}/jobs/${testJob.id}/interleave-7a.webp`) as any;
+
+  await assert.rejects(
+    async () => {
+      await markPhotoForDeletion(db, user1.id, testJob.id, row7a.id);
+    },
+    (err: any) => err.message.includes("currently locked by active background cleanup processing"),
+    "markPhotoForDeletion must reject rows actively leased by a cleaner"
+  );
+  const row7aCheck = sqlite.prepare("SELECT status, cleanup_worker_id FROM job_photos WHERE id = ?").get(row7a.id) as any;
+  assert.strictEqual(row7aCheck.status, "CLEANING", "Active cleaner lease preserved");
+  assert.strictEqual(row7aCheck.cleanup_worker_id, "active-sweeper");
+
+  // Subcase 7b: Background Sweeper claims row concurrently after HTTP markPhotoForDeletion, fencing out HTTP finalizePhotoDeletion
+  const row7b = sqlite.prepare(`
+    INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at)
+    VALUES (?, ?, ?, 'ACTIVE', datetime('now'))
+    RETURNING id, r2_key
+  `).get(testJob.id, user1.id, `users/${user1.id}/jobs/${testJob.id}/interleave-7b.webp`) as any;
+
+  // HTTP route marks photo and receives generation 1
+  const marked7b = await markPhotoForDeletion(db, user1.id, testJob.id, row7b.id);
+  assert.strictEqual(marked7b.status, "PENDING_DELETE");
+  assert.strictEqual(marked7b.cleanup_generation, 1);
+
+  // Background sweeper steps in concurrently before HTTP finalize, bumping generation to 2
+  const sweeperClaim7b = sqlite.prepare(`
+    UPDATE job_photos
+    SET status = 'CLEANING', cleanup_worker_id = 'sweeper-7b', cleanup_generation = 2, cleanup_lease_expires_at = datetime('now', '+2 minutes')
+    WHERE id = ? AND cleanup_generation = 1
+  `).run(row7b.id);
+  assert.strictEqual((sweeperClaim7b as any).changes, 1, "Sweeper successfully claimed row");
+
+  // HTTP route attempts finalize with stale generation token 1: must be fenced out!
+  const finalized7b = await finalizePhotoDeletion(db, user1.id, row7b.id, marked7b.cleanup_generation);
+  assert.strictEqual(finalized7b, false, "Stale HTTP finalize must be fenced out (0 rows deleted)");
+
+  const check7b = sqlite.prepare("SELECT status, cleanup_generation FROM job_photos WHERE id = ?").get(row7b.id) as any;
+  assert.strictEqual(check7b.status, "CLEANING", "Sweeper lease preserved from stale HTTP finalize");
+  assert.strictEqual(check7b.cleanup_generation, 2);
+
+  // Sweeper finishes deletion under valid generation 2
+  const sweeperFinalize7b = await db.prepare(
+    `DELETE FROM job_photos WHERE id = ? AND status = 'CLEANING' AND cleanup_worker_id = 'sweeper-7b' AND cleanup_generation = 2`
+  ).bind(row7b.id).run();
+  assert.strictEqual((sweeperFinalize7b as any).changes, 1, "Sweeper finalized deletion");
+
+  // Subcase 7c: Expired lease allows HTTP deletion to recover row
+  const row7c = sqlite.prepare(`
+    INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at, cleanup_worker_id, cleanup_generation, cleanup_lease_expires_at)
+    VALUES (?, ?, ?, 'CLEANING', datetime('now', '-5 minutes'), 'dead-worker', 1, datetime('now', '-1 minute'))
+    RETURNING id, r2_key
+  `).get(testJob.id, user1.id, `users/${user1.id}/jobs/${testJob.id}/interleave-7c.webp`) as any;
+
+  const marked7c = await markPhotoForDeletion(db, user1.id, testJob.id, row7c.id);
+  assert.strictEqual(marked7c.status, "PENDING_DELETE");
+  assert.strictEqual(marked7c.cleanup_generation, 2, "Generation incremented to fence out dead worker");
+  const finalized7c = await finalizePhotoDeletion(db, user1.id, row7c.id, marked7c.cleanup_generation);
+  assert.strictEqual(finalized7c, true, "HTTP deletion finalized recovered expired row");
+
+  // Subcase 7d (R7-A2): Late PUT / expired reservation rejects activation and triggers cleanup
+  const scenario7LateKey = `users/${user1.id}/jobs/${testJob.id}/late-put-${Date.now()}.webp`;
+  await putPhoto(null, scenario7LateKey, testPayload, "image/webp");
+  const rowLate = sqlite.prepare(`
+    INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at, slot_number)
+    VALUES (?, ?, ?, 'RESERVED', datetime('now', '-6 minutes'), 1)
+    RETURNING id
+  `).get(testJob.id, user1.id, scenario7LateKey) as any;
+
+  await assert.rejects(
+    async () => {
+      await activatePhotoSlot(db, user1.id, rowLate.id, scenario7LateKey);
+    },
+    (err: any) => err.message.includes("reservation expired (>5m)"),
+    "Expired reservation must reject activation"
+  );
+  // Production upload handler catch block cleans up R2 and fails D1 slot
+  await deletePhoto(null, scenario7LateKey);
+  await failPhotoSlot(db, user1.id, rowLate.id);
+
+  const lateR2Check = await getPhoto(null, scenario7LateKey);
+  assert.strictEqual(lateR2Check, null, "R2 object immediately pruned upon activation rejection");
+  const lateD1Check = sqlite.prepare("SELECT id FROM job_photos WHERE id = ?").get(rowLate.id);
+  assert.strictEqual(lateD1Check, undefined, "D1 slot failed and removed");
+  console.log("  ✓ Scenario 7: Deterministic HTTP deletion vs Sweeper contention, lease fencing, and late PUT rejection verified");
+
   // =========================================================================
   // 11. BLOCKER B: Scheduled Reconciliation Runtime Wiring Verification
   // =========================================================================
@@ -1601,8 +1705,68 @@ async function runRemediationVerification() {
   );
   assert.strictEqual(waitUntilInvoked, true, "worker.scheduled dispatched to ctx.waitUntil");
   assert.ok(waitUntilPromise !== null);
-  await waitUntilPromise;
   console.log("  ✓ BLOCKER B: Scheduled event handler entrypoint and ctx.waitUntil execution verified");
+
+  // 4. R7-A3: Fail-closed scheduled runtime tests
+  await assert.rejects(
+    async () => {
+      await handleScheduledEvent(
+        { cron: "0 3 * * *", scheduledTime: Date.now() },
+        { PHOTOS: dummyR2ForScheduled } // DB missing
+      );
+    },
+    (err: any) => err.message.includes("D1 database binding 'DB' is missing"),
+    "handleScheduledEvent must fail closed and throw when DB binding is missing"
+  );
+
+  await assert.rejects(
+    async () => {
+      await handleScheduledEvent(
+        { cron: "0 3 * * *", scheduledTime: Date.now() },
+        { DB: db } // PHOTOS / R2 missing
+      );
+    },
+    (err: any) => err.message.includes("R2 storage binding ('PHOTOS' or 'R2') is missing"),
+    "handleScheduledEvent must fail closed and throw when R2 binding is missing"
+  );
+
+  // Verify worker.scheduled passes rejected promise to ctx.waitUntil on missing bindings
+  let rejectedPromise: Promise<any> | null = null;
+  const failingCtx = {
+    waitUntil(p: Promise<any>) {
+      rejectedPromise = p;
+    },
+  };
+  await worker.scheduled(
+    { cron: "0 3 * * *", scheduledTime: Date.now() },
+    { PHOTOS: dummyR2ForScheduled }, // Missing DB
+    failingCtx
+  );
+  assert.ok(rejectedPromise !== null, "worker.scheduled dispatched promise to ctx.waitUntil");
+  await assert.rejects(
+    rejectedPromise,
+    (err: any) => err.message.includes("D1 database binding 'DB' is missing"),
+    "ctx.waitUntil received rejected promise notifying Cloudflare runtime of cron failure"
+  );
+  console.log("  ✓ R7-A3: Scheduled maintenance fail-closed error reporting verified");
+
+  // 5. R7-B1: Fail-closed production fetch handler
+  resetFetchHandlerForTesting();
+  const originalNodeEnv = process.env.NODE_ENV;
+  try {
+    process.env.NODE_ENV = "production";
+    await assert.rejects(
+      async () => {
+        await resolveFetchHandler();
+      },
+      (err: any) => err.message.includes("Production fetch handler initialization failed"),
+      "resolveFetchHandler must throw in production when vinext/server/fetch-handler is unavailable"
+    );
+  } finally {
+    process.env.NODE_ENV = originalNodeEnv;
+    resetFetchHandlerForTesting();
+  }
+  console.log("  ✓ R7-B1: Production fetch handler fail-closed behavior verified");
 
   // =========================================================================
   // 12. BLOCKER C: Migration Chain Safety on Fresh & Populated Databases

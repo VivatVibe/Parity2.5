@@ -819,17 +819,42 @@ export async function markPhotoForDeletion(
   jobId: number,
   photoId: number
 ): Promise<JobPhotoRecord> {
+  // P0-02 / R7-A1: Unified deletion ownership protocol with atomic generation fencing.
+  // Atomically increment cleanup_generation to fence out prior workers or in-flight leases.
+  // Only allow transition from non-CLEANING states or from expired CLEANING leases.
   const photo = await db
     .prepare(
-      `UPDATE job_photos SET status = 'PENDING_DELETE', slot_number = NULL 
+      `UPDATE job_photos 
+       SET status = 'PENDING_DELETE', 
+           slot_number = NULL,
+           cleanup_generation = COALESCE(cleanup_generation, 0) + 1
        WHERE id = ? AND job_id = ? AND user_id = ? 
+         AND (
+           status != 'CLEANING' 
+           OR cleanup_lease_expires_at IS NULL 
+           OR cleanup_lease_expires_at < datetime('now')
+         )
        RETURNING *`
     )
     .bind(photoId, jobId, userId)
     .first<JobPhotoRecord>();
 
   if (!photo) {
-    throw new Error(`Photo ID ${photoId} not found or does not belong to user ${userId}`);
+    // Check if photo exists to diagnose active background lease contention vs non-existent photo
+    const existing = await db
+      .prepare(
+        "SELECT id, status, cleanup_lease_expires_at FROM job_photos WHERE id = ? AND job_id = ? AND user_id = ?"
+      )
+      .bind(photoId, jobId, userId)
+      .first<{ id: number; status: string; cleanup_lease_expires_at: string | null }>();
+
+    if (!existing) {
+      throw new Error(`Photo ID ${photoId} not found or does not belong to user ${userId}`);
+    }
+    // Photo exists but is locked by an active background cleanup lease
+    throw new Error(
+      `Photo ID ${photoId} is currently locked by active background cleanup processing`
+    );
   }
   return photo;
 }
@@ -837,12 +862,24 @@ export async function markPhotoForDeletion(
 export async function finalizePhotoDeletion(
   db: D1Database,
   userId: number,
-  photoId: number
-): Promise<void> {
-  await db
-    .prepare("DELETE FROM job_photos WHERE id = ? AND user_id = ?")
-    .bind(photoId, userId)
-    .run();
+  photoId: number,
+  expectedGeneration?: number
+): Promise<boolean> {
+  // P0-02 / R7-A1: Conditional finalization fencing.
+  // Strictly verifies status is PENDING_DELETE and cleanup_generation matches expected token.
+  // Ensures HTTP deletion cannot clobber a row concurrently claimed by a background sweeper.
+  let query =
+    "DELETE FROM job_photos WHERE id = ? AND user_id = ? AND status = 'PENDING_DELETE'";
+  const params: any[] = [photoId, userId];
+
+  if (expectedGeneration !== undefined) {
+    query += " AND (cleanup_generation IS ? OR cleanup_generation = ?)";
+    params.push(expectedGeneration, expectedGeneration);
+  }
+
+  const res = await db.prepare(query).bind(...params).run();
+  const changes = (res as any)?.changes ?? (res as any)?.meta?.changes ?? 0;
+  return changes > 0;
 }
 
 export async function createJobPhoto(
@@ -863,7 +900,7 @@ export async function deleteJobPhoto(
   photoId: number
 ): Promise<JobPhotoRecord> {
   const marked = await markPhotoForDeletion(db, userId, jobId, photoId);
-  await finalizePhotoDeletion(db, userId, photoId);
+  await finalizePhotoDeletion(db, userId, photoId, marked.cleanup_generation);
   return marked;
 }
 
