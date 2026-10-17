@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
-  job_number TEXT NOT NULL UNIQUE,
+  job_number TEXT NOT NULL,
   job_type TEXT NOT NULL, -- 'REPAIR', 'PROJECT', 'RETAINER'
   title TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'RECEIVED', -- 'RECEIVED', 'IN_PROGRESS', 'WAITING', 'COMPLETED', 'DELIVERED', 'ACTIVE', 'CANCELLED'
@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   total_quoted_amount REAL DEFAULT 0,
   metadata TEXT NOT NULL DEFAULT '{}', -- JSON validated by Zod Discriminated Union
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(user_id, job_number)
 );
 
 -- 4. Atomic Job Code Counters
@@ -69,11 +70,12 @@ CREATE TABLE IF NOT EXISTS job_photos (
 );
 
 -- Indexes for performance & strict tenant queries
-CREATE INDEX IF NOT EXISTS idx_clients_user_id ON clients(user_id);
+CREATE INDEX IF NOT EXISTS idx_clients_user ON clients(user_id);
 CREATE INDEX IF NOT EXISTS idx_clients_phone ON clients(user_id, phone);
-CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON jobs(user_id);
-CREATE INDEX IF NOT EXISTS idx_jobs_client_id ON jobs(client_id);
-CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(user_id, status);
-CREATE INDEX IF NOT EXISTS idx_payments_job_id ON job_payments(job_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_client ON jobs(client_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_user_status ON jobs(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_jobs_user_type ON jobs(user_id, job_type);
+CREATE INDEX IF NOT EXISTS idx_payments_job ON job_payments(job_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_payments_billing ON job_payments(user_id, billing_period);
-CREATE INDEX IF NOT EXISTS idx_photos_job_id ON job_photos(job_id);
+CREATE INDEX IF NOT EXISTS idx_photos_job ON job_photos(job_id, user_id);

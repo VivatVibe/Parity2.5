@@ -8,9 +8,18 @@ export interface SessionPayload {
   avatarUrl?: string;
 }
 
-const JWT_SECRET_STRING = process.env.JWT_SECRET || "parity-2-5-super-secret-jwt-key-2026-edge";
-const JWT_SECRET = new TextEncoder().encode(JWT_SECRET_STRING);
 const COOKIE_NAME = "parity_session";
+
+function getJwtSecret(): Uint8Array {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error("JWT_SECRET environment variable is strictly required in production");
+    }
+    return new TextEncoder().encode("parity-dev-secret-only-for-local-2026");
+  }
+  return new TextEncoder().encode(secret);
+}
 
 // 1. Google OAuth Client (Arctic)
 export function getGoogleOAuthClient() {
@@ -23,16 +32,18 @@ export function getGoogleOAuthClient() {
 
 // 2. Session Token Operations (Jose Web Crypto)
 export async function createSessionToken(payload: SessionPayload): Promise<string> {
+  const secret = getJwtSecret();
   return await new SignJWT({ ...payload })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
     .setExpirationTime("30d")
-    .sign(JWT_SECRET);
+    .sign(secret);
 }
 
 export async function verifySessionToken(token: string): Promise<SessionPayload | null> {
   try {
-    const { payload } = await jwtVerify(token, JWT_SECRET);
+    const secret = getJwtSecret();
+    const { payload } = await jwtVerify(token, secret);
     return {
       userId: payload.userId as number,
       email: payload.email as string,

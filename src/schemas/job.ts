@@ -14,56 +14,56 @@ export const JobStatusEnum = z.enum([
 ]);
 export type JobStatus = z.infer<typeof JobStatusEnum>;
 
-// Specific Metadata Schemas (Stored in `jobs.metadata` as JSON)
+// Specific Metadata Schemas (Stored in jobs.metadata as JSON)
 export const RepairMetadataSchema = z.object({
-  deviceModel: z.string().min(1, "Device model is required"),
-  serialNumber: z.string().optional().default(""),
-  symptom: z.string().min(1, "Symptom description is required"),
-  accessories: z.string().optional().default(""),
-  partsCost: z.number().nonnegative().optional().default(0),
+  deviceModel: z.string().trim().min(1, "Device model is required"),
+  serialNumber: z.string().trim().optional().default(""),
+  symptom: z.string().trim().min(1, "Symptom description is required"),
+  accessories: z.string().trim().optional().default(""),
+  partsCost: z.coerce.number().nonnegative().optional().default(0),
 });
 export type RepairMetadata = z.infer<typeof RepairMetadataSchema>;
 
 export const ProjectMetadataSchema = z.object({
-  domainUrl: z.string().url().or(z.string().min(1)).optional().default(""),
-  scopeSummary: z.string().min(1, "Scope summary is required"),
-  repoUrl: z.string().url().or(z.string().min(1)).optional().default(""),
-  deliverables: z.string().optional().default(""),
+  domainUrl: z.string().trim().optional().default(""),
+  scopeSummary: z.string().trim().min(1, "Scope summary is required"),
+  repoUrl: z.string().trim().optional().default(""),
+  deliverables: z.string().trim().optional().default(""),
 });
 export type ProjectMetadata = z.infer<typeof ProjectMetadataSchema>;
 
 export const RetainerMetadataSchema = z.object({
-  billingCycleDay: z.number().int().min(1).max(31),
-  monthlyRate: z.number().nonnegative(),
-  serviceScope: z.string().min(1, "Service scope is required"),
+  billingCycleDay: z.coerce.number().int().min(1).max(31),
+  monthlyRate: z.coerce.number().nonnegative(),
+  serviceScope: z.string().trim().min(1, "Service scope is required"),
 });
 export type RetainerMetadata = z.infer<typeof RetainerMetadataSchema>;
 
 // Discriminated Union for Job Input & Validation
 export const RepairJobInputSchema = z.object({
   job_type: z.literal("REPAIR"),
-  client_id: z.number().int().positive(),
-  title: z.string().min(1, "Title is required"),
+  client_id: z.coerce.number().int().positive("Client is required"),
+  title: z.string().trim().min(1, "Title is required"),
   due_date: z.string().optional(),
-  total_quoted_amount: z.number().nonnegative().default(0),
+  total_quoted_amount: z.coerce.number().nonnegative().default(0),
   metadata: RepairMetadataSchema,
 });
 
 export const ProjectJobInputSchema = z.object({
   job_type: z.literal("PROJECT"),
-  client_id: z.number().int().positive(),
-  title: z.string().min(1, "Title is required"),
+  client_id: z.coerce.number().int().positive("Client is required"),
+  title: z.string().trim().min(1, "Title is required"),
   due_date: z.string().optional(),
-  total_quoted_amount: z.number().nonnegative().default(0),
+  total_quoted_amount: z.coerce.number().nonnegative().default(0),
   metadata: ProjectMetadataSchema,
 });
 
 export const RetainerJobInputSchema = z.object({
   job_type: z.literal("RETAINER"),
-  client_id: z.number().int().positive(),
-  title: z.string().min(1, "Title is required"),
+  client_id: z.coerce.number().int().positive("Client is required"),
+  title: z.string().trim().min(1, "Title is required"),
   due_date: z.string().optional(),
-  total_quoted_amount: z.number().nonnegative().default(0),
+  total_quoted_amount: z.coerce.number().nonnegative().default(0),
   metadata: RetainerMetadataSchema,
 });
 

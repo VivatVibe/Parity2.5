@@ -71,7 +71,7 @@ export async function initDatabase(db: D1Database): Promise<void> {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
-      job_number TEXT NOT NULL UNIQUE,
+      job_number TEXT NOT NULL,
       job_type TEXT NOT NULL,
       title TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'RECEIVED',
@@ -79,7 +79,8 @@ export async function initDatabase(db: D1Database): Promise<void> {
       total_quoted_amount REAL DEFAULT 0,
       metadata TEXT NOT NULL DEFAULT '{}',
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, job_number)
     );
 
     CREATE TABLE IF NOT EXISTS job_counters (
@@ -110,17 +111,17 @@ export async function initDatabase(db: D1Database): Promise<void> {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
-    CREATE INDEX IF NOT EXISTS idx_clients_user_id ON clients(user_id);
+    CREATE INDEX IF NOT EXISTS idx_clients_user ON clients(user_id);
     CREATE INDEX IF NOT EXISTS idx_clients_phone ON clients(user_id, phone);
-    CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON jobs(user_id);
-    CREATE INDEX IF NOT EXISTS idx_jobs_client_id ON jobs(client_id);
-    CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(user_id, status);
-    CREATE INDEX IF NOT EXISTS idx_payments_job_id ON job_payments(job_id);
+    CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id);
+    CREATE INDEX IF NOT EXISTS idx_jobs_client ON jobs(client_id);
+    CREATE INDEX IF NOT EXISTS idx_jobs_user_status ON jobs(user_id, status);
+    CREATE INDEX IF NOT EXISTS idx_jobs_user_type ON jobs(user_id, job_type);
+    CREATE INDEX IF NOT EXISTS idx_payments_job ON job_payments(job_id, user_id);
     CREATE INDEX IF NOT EXISTS idx_payments_billing ON job_payments(user_id, billing_period);
-    CREATE INDEX IF NOT EXISTS idx_photos_job_id ON job_photos(job_id);
+    CREATE INDEX IF NOT EXISTS idx_photos_job ON job_photos(job_id, user_id);
   `;
 
-  // Split and execute statements
   const statements = schema
     .split(";")
     .map((s) => s.trim())
@@ -163,8 +164,23 @@ export async function getOrCreateUser(
 // 3. Client Operations (Enforcing userId)
 export async function getClients(db: D1Database, userId: number): Promise<ClientRecord[]> {
   const { results } = await db
-    .prepare("SELECT * FROM clients WHERE user_id = ? ORDER BY name ASC")
+    .prepare("SELECT * FROM clients WHERE user_id = ? ORDER BY id DESC")
     .bind(userId)
+    .all<ClientRecord>();
+  return results || [];
+}
+
+export async function searchClients(
+  db: D1Database,
+  userId: number,
+  searchQuery: string
+): Promise<ClientRecord[]> {
+  const q = `%${searchQuery.trim()}%`;
+  const { results } = await db
+    .prepare(
+      "SELECT * FROM clients WHERE user_id = ? AND (name LIKE ? OR phone LIKE ?) ORDER BY id DESC LIMIT 10"
+    )
+    .bind(userId, q, q)
     .all<ClientRecord>();
   return results || [];
 }
@@ -186,7 +202,11 @@ export async function createClient(
 }
 
 // 4. Atomic Counter & Sequence Generator
-export async function getNextJobNumber(db: D1Database, userId: number, jobType: "REPAIR" | "PROJECT" | "RETAINER"): Promise<string> {
+export async function getNextJobNumber(
+  db: D1Database,
+  userId: number,
+  jobType: "REPAIR" | "PROJECT" | "RETAINER"
+): Promise<string> {
   const prefixMap: Record<string, string> = {
     REPAIR: "PR",
     PROJECT: "PJ",
@@ -194,7 +214,6 @@ export async function getNextJobNumber(db: D1Database, userId: number, jobType: 
   };
   const prefix = prefixMap[jobType] || "JB";
 
-  // Atomic SQLite counter upsert
   const query = `
     INSERT INTO job_counters (user_id, prefix, seq)
     VALUES (?, ?, 1)
@@ -207,12 +226,22 @@ export async function getNextJobNumber(db: D1Database, userId: number, jobType: 
   return `${prefix}-${String(seq).padStart(4, "0")}`;
 }
 
-// 5. Job Operations (Enforcing userId)
+// 5. Job Operations (Enforcing userId & client verification)
 export async function createJob(
   db: D1Database,
   userId: number,
   input: JobInput
 ): Promise<JobRecord> {
+  // Prevent Cross-Tenant client_id injection
+  const client = await db
+    .prepare("SELECT id FROM clients WHERE id = ? AND user_id = ?")
+    .bind(input.client_id, userId)
+    .first<ClientRecord>();
+
+  if (!client) {
+    throw new Error(`Client ID ${input.client_id} not found or does not belong to user ${userId}`);
+  }
+
   const jobNumber = await getNextJobNumber(db, userId, input.job_type);
   const metadataJson = JSON.stringify(input.metadata);
   const initialStatus = input.job_type === "RETAINER" ? "ACTIVE" : "RECEIVED";
