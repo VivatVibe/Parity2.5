@@ -60,6 +60,7 @@ export interface JobPhotoRecord {
   last_cleanup_error?: string;
   cleanup_worker_id?: string;
   cleanup_generation?: number;
+  cleanup_lease_expires_at?: string;
   created_at: string;
 }
 
@@ -136,6 +137,7 @@ export async function initDatabase(db: D1Database): Promise<void> {
       last_cleanup_error TEXT,
       cleanup_worker_id TEXT,
       cleanup_generation INTEGER DEFAULT 0,
+      cleanup_lease_expires_at DATETIME,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(job_id, slot_number)
     );
@@ -860,6 +862,25 @@ export async function deleteJobPhoto(
   return marked;
 }
 
+export async function renewPhotoCleanupLease(
+  db: D1Database,
+  photoId: number,
+  workerId: string,
+  generation: number,
+  extensionMinutes = 2
+): Promise<boolean> {
+  const res = await db
+    .prepare(
+      `UPDATE job_photos 
+       SET cleanup_lease_expires_at = datetime('now', '+' || ? || ' minutes')
+       WHERE id = ? AND status = 'CLEANING' AND cleanup_worker_id = ? AND cleanup_generation = ?`
+    )
+    .bind(extensionMinutes, photoId, workerId, generation)
+    .run();
+  const changes = (res as any)?.changes ?? (res as any)?.meta?.changes ?? 0;
+  return changes > 0;
+}
+
 export async function cleanupOrphanedPhotos(
   db: D1Database,
   r2: any,
@@ -872,14 +893,17 @@ export async function cleanupOrphanedPhotos(
       ? crypto.randomUUID()
       : `worker-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
 
-  // 1. Select candidate records for cleanup (PENDING_DELETE, expired RESERVED > 5m, or expired CLEANING lease > 5m)
+  // 1. Select candidate records for cleanup:
+  // - Explicitly marked PENDING_DELETE
+  // - Expired RESERVED (> 5m old)
+  // - Stale CLEANING leases where cleanup_lease_expires_at is strictly in the PAST
   let query = `
-    SELECT id, user_id, r2_key, status, created_at, cleanup_attempts, cleanup_generation 
+    SELECT id, user_id, r2_key, status, created_at, cleanup_attempts, cleanup_generation, cleanup_lease_expires_at 
     FROM job_photos 
     WHERE (
       status = 'PENDING_DELETE' 
       OR (status = 'RESERVED' AND created_at < datetime('now', '-5 minutes'))
-      OR (status = 'CLEANING' AND created_at < datetime('now', '-5 minutes'))
+      OR (status = 'CLEANING' AND cleanup_lease_expires_at IS NOT NULL AND cleanup_lease_expires_at < datetime('now'))
     )
   `;
   const params: any[] = [];
@@ -896,6 +920,7 @@ export async function cleanupOrphanedPhotos(
     created_at: string;
     cleanup_attempts: number;
     cleanup_generation: number;
+    cleanup_lease_expires_at: string | null;
   }>();
 
   let cleanedCount = 0;
@@ -903,28 +928,31 @@ export async function cleanupOrphanedPhotos(
   let skippedCount = 0;
 
   for (const row of results || []) {
-    // 2. Atomic CAS state transition to 'CLEANING' with generation increment and lease ownership.
-    // Check affected-row count before performing any external operation to prevent stale/simultaneous sweepers.
+    const targetGen = (row.cleanup_generation || 0) + 1;
+
+    // 2. Atomic CAS state transition to 'CLEANING' with independent lease expiry timestamp (now + 2m)
+    // and generation increment. Fences out stale and concurrent sweepers safely.
     const claimRes = await db
       .prepare(
         `UPDATE job_photos 
          SET status = 'CLEANING', 
              cleanup_worker_id = ?, 
-             cleanup_generation = COALESCE(cleanup_generation, 0) + 1,
+             cleanup_generation = ?,
+             cleanup_lease_expires_at = datetime('now', '+2 minutes'),
              slot_number = NULL
          WHERE id = ? 
            AND (
              status = 'PENDING_DELETE' 
              OR (status = 'RESERVED' AND created_at < datetime('now', '-5 minutes'))
-             OR (status = 'CLEANING' AND created_at < datetime('now', '-5 minutes'))
+             OR (status = 'CLEANING' AND cleanup_lease_expires_at IS NOT NULL AND cleanup_lease_expires_at < datetime('now'))
            )`
       )
-      .bind(currentWorkerId, row.id)
+      .bind(currentWorkerId, targetGen, row.id)
       .run();
 
     const affected = (claimRes as any)?.changes ?? (claimRes as any)?.meta?.changes ?? 0;
     if (affected === 0) {
-      // Row was modified, claimed by another worker, or changed state concurrently. Skip!
+      // Row was claimed by another worker, updated, or lease was active. Skip!
       skippedCount++;
       continue;
     }
@@ -941,25 +969,28 @@ export async function cleanupOrphanedPhotos(
     }
 
     if (r2Success) {
-      // 4a. Conditional D1 row deletion: verify ownership and status before deleting
+      // 4a. Conditional D1 row deletion: verify ownership AND generation before purging.
+      // Stale workers whose lease expired cannot delete or overwrite newer state!
       const delRes = await db
         .prepare(
           `DELETE FROM job_photos 
            WHERE id = ? 
              AND status = 'CLEANING' 
-             AND cleanup_worker_id = ?`
+             AND cleanup_worker_id = ?
+             AND cleanup_generation = ?`
         )
-        .bind(row.id, currentWorkerId)
+        .bind(row.id, currentWorkerId, targetGen)
         .run();
 
       const delAffected = (delRes as any)?.changes ?? (delRes as any)?.meta?.changes ?? 0;
       if (delAffected > 0) {
         cleanedCount++;
       } else {
+        // Lease was stolen by a newer worker while R2 delete was running.
         skippedCount++;
       }
     } else {
-      // 4b. Revert to PENDING_DELETE with diagnostic error and incremented retry count
+      // 4b. Revert to PENDING_DELETE with diagnostic error and clear lease expiry
       failedCount++;
       await db
         .prepare(
@@ -967,12 +998,14 @@ export async function cleanupOrphanedPhotos(
            SET status = 'PENDING_DELETE', 
                cleanup_attempts = COALESCE(cleanup_attempts, 0) + 1, 
                last_cleanup_error = ?,
-               cleanup_worker_id = NULL 
+               cleanup_worker_id = NULL,
+               cleanup_lease_expires_at = NULL 
            WHERE id = ? 
              AND status = 'CLEANING' 
-             AND cleanup_worker_id = ?`
+             AND cleanup_worker_id = ?
+             AND cleanup_generation = ?`
         )
-        .bind(r2Error, row.id, currentWorkerId)
+        .bind(r2Error, row.id, currentWorkerId, targetGen)
         .run();
     }
   }

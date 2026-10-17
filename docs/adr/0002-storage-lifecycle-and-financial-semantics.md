@@ -1,104 +1,108 @@
-# ADR 0002: Cross-Service Storage Protocol, Atomic Sweeper CAS, & Persistent Financial Idempotency
+# ADR 0002: Storage Lifecycle, Distributed Leases, & Immutable Financial Operations
 
 ## Status
-Accepted (Amended for Final Production Readiness Re-Audit: P0-01, P0-02, P1-03, Migration Safety)
+Accepted (Amended for Independent Audit Corrections: Reconciler Safety, Sweeper Lease Semantics, Payment Payload Persistence)
 
 ## Context
-During the independent re-audit of PR #2, three critical correctness edge cases and one migration safety requirement were identified:
-1. **P0-01 (Delayed R2 PUT After Sweeper Deletion):** When an in-flight R2 PUT outlives the reservation TTL, the sweeper marks the row pending deletion and purges D1, after which the late PUT completes in R2 and the worker dies before compensation. Activation-time generation checks cannot physically prevent external network writes. An asynchronous cross-service reconciler is required so no unrecoverable orphan can ever remain.
-2. **P0-02 (Stale Sweeper Deletion):** Sweepers selecting records and deleting rows via `WHERE id = ?` could race against concurrent sweepers, state transitions, or active uploads. Atomic CAS lease transitions with explicit ownership and generation checks are required.
-3. **P1-03 (Payment Retry Persistence):** Unresolved payment operations (due to timeouts, page reloads, or uncertain responses) must retry using their original idempotency key, while preserving the ability to create distinct partial payments.
-4. **Migration Safety (Surplus Photo Retention):** Preexisting customer photos exceeding the 5-photo quota must not be automatically deleted without an explicit retention policy.
+Following the PR #2 audit, three targeted correctness defects were resolved:
+1. **R2 Reconciler Safety:** The initial reconciler erroneously treated non-ACTIVE objects as orphans, threatening in-flight uploads (`RESERVED`) and active sweeper leases (`CLEANING`, `PENDING_DELETE`). Pagination was also unhandled.
+2. **Sweeper Lease Semantics:** Lease expiration relied on `created_at` (the photo's original upload timestamp) instead of an independent lease acquisition timestamp, causing immediate lease stealing on older records. Generation checks were not enforced on deletion.
+3. **Payment Retry Payload Persistence:** Only the idempotency key string was persisted. A reload or dashboard balance change caused a mismatch between the persisted key and new amount, triggering 409 conflicts, which were then silently cleared from storage.
 
 ---
 
-## 1. P0-01: Cross-Service Storage Protocol & Storage Reconciler
+## 1. Safe R2 Reconciliation Architecture
 
-### The Asynchronous Interleaving Problem
-In a decoupled edge architecture (Cloudflare Workers, D1 Database, R2 Object Storage), R2 does not support distributed two-phase commit with D1:
-1. Upload A reserves a slot in D1 (`status = 'RESERVED'`).
-2. Upload A begins streaming bytes via R2 `put()`, which stalls in flight beyond the 5-minute TTL.
-3. Sweeper runs, transitions expired reservation to `CLEANING`, calls R2 delete (no-op as bytes are not yet written), and deletes the D1 row.
-4. Upload A's delayed R2 PUT finally lands in R2.
-5. Upload A's worker terminates or crashes before compensation can execute.
+### Safe Orphan Eligibility Predicate
+An R2 storage object at `object.key` is considered eligible for reconciliation purging **only** when all of the following conditions hold:
+1. **Creation Age Exceeds Grace Period:** `now - object.uploaded > safetyGracePeriodMs` (default: 15 minutes). This prevents race conditions with concurrent multipart or in-flight upload streaming before D1 activation.
+2. **Safe D1 State Check:**
+   ```sql
+   SELECT id, status FROM job_photos WHERE r2_key = ? LIMIT 1
+   ```
+   - If `status = 'ACTIVE'`: Protected production asset.
+   - If `status = 'RESERVED'`: Protected in-flight upload.
+   - If `status = 'CLEANING'`: Protected active sweeper lease.
+   - If `status = 'PENDING_DELETE'`: Protected queued deletion managed by the D1 sweeper.
+   - **Only if NO record exists in D1** (or status is explicitly `FAILED`): The object is a confirmed unreferenced orphan (e.g. from an aborted upload where D1 reservation was deleted or a late PUT that landed after sweeper completion).
 
-Because the D1 record was purged in Step 3, D1 has no record of the R2 key. A standard D1-driven query can never find this object.
+### Cursor Pagination & Interruption Recovery
+`reconcileR2Storage()` utilizes the R2 continuation `cursor` to iterate across buckets without memory exhaustion. If interrupted, the reconciler can resume from the last cursor or simply restart on the next cron invocation without data loss, because reconciliation is strictly idempotent and read-first.
 
-### The Safe Protocol Solution
-We enforce a dual-layer lifecycle:
-1. **Worker-Side Fencing (Fast Path):**
-   `activatePhotoSlot()` requires `created_at >= datetime('now', '-5 minutes')` and key matching. A delayed upload that finishes in the worker fails activation, catches the error, and deletes the R2 object.
-2. **Storage Reconciler (`reconcileR2Storage`) (Asynchronous Safety Net):**
-   To guard against worker crashes or lost compensation (Step 5 above), the system runs an asynchronous storage reconciler:
-   - Scans R2 objects via `r2.list({ prefix: 'users/' })`.
-   - Compares each object's `uploaded` timestamp against a safety grace period (5 minutes) to avoid interfering with in-flight uploads.
-   - For objects older than the grace period, queries D1: `SELECT id FROM job_photos WHERE r2_key = ? AND status = 'ACTIVE' LIMIT 1`.
-   - If no active D1 record exists, the reconciler calls `deletePhoto(r2, object.key)`.
+### Invocation & Scheduling
+Reconciliation is exposed via `POST /api/maintenance/reconcile` (secured by `CRON_SECRET` / bearer authorization) and callable by Cloudflare Workers cron triggers.
 
-**Guarantee:** No orphan remains unrecoverable. Even in the worst-case worker death scenario, the storage reconciler detects and purges the unreferenced object.
+### Architectural Limitations
+R2 reconciliation is an **eventual consistency safety net**, not a distributed ACID transaction. A late-written PUT that arrives after D1 deletion remains temporarily in R2 until the reconciler's next run after the 15-minute grace period expires.
 
 ---
 
-## 2. P0-02: Stale Sweeper Prevention via Atomic CAS & Leases
+## 2. Distributed Sweeper Lease Semantics
 
-### Schema Design for Concurrency
-`job_photos` is enhanced with:
-- `slot_number INTEGER CHECK(slot_number BETWEEN 1 AND 5)` (nullable to allow tombstones and legacy surplus).
-- `status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('RESERVED', 'ACTIVE', 'PENDING_DELETE', 'FAILED', 'CLEANING'))`.
-- `cleanup_attempts INTEGER DEFAULT 0`: Retry counter for transient network/R2 failures.
-- `last_cleanup_error TEXT`: Preserves diagnostic error metadata.
-- `cleanup_worker_id TEXT`: Holds the unique lease owner during active cleanup.
-- `cleanup_generation INTEGER DEFAULT 0`: Monotonically incremented generation token.
+### Schema Enhancement
+`job_photos` is equipped with an explicit lease expiration column:
+- `cleanup_lease_expires_at DATETIME`: Absolute timestamp when the active sweeper lease expires (e.g. `datetime('now', '+2 minutes')`).
+- `cleanup_worker_id TEXT`: Unique identity of the current lease holder.
+- `cleanup_generation INTEGER DEFAULT 0`: Monotonically incremented generation counter.
 
-### Atomic CAS State Transitions
-To guarantee that concurrent sweepers and active uploads never delete or modify records that have changed state:
-1. **Candidate Selection:**
-   Find rows where `status = 'PENDING_DELETE'` or expired `RESERVED` (>5m) or stale `CLEANING` (>5m).
-2. **Atomic Lease Claim (CAS):**
+### State Invariants & CAS Protocol
+1. **Candidate Query:** Selects records that are `PENDING_DELETE`, expired `RESERVED` (>5m), or `CLEANING` where `cleanup_lease_expires_at < datetime('now')`.
+2. **Atomic CAS Lease Claim:**
    ```sql
    UPDATE job_photos 
    SET status = 'CLEANING', 
        cleanup_worker_id = :workerId, 
-       cleanup_generation = COALESCE(cleanup_generation, 0) + 1,
+       cleanup_generation = :nextGen,
+       cleanup_lease_expires_at = datetime('now', '+2 minutes'),
        slot_number = NULL
    WHERE id = :id 
-     AND (status = 'PENDING_DELETE' OR (status = 'RESERVED' AND created_at < datetime('now', '-5 minutes')) OR (status = 'CLEANING' AND created_at < datetime('now', '-5 minutes')));
+     AND (
+       status = 'PENDING_DELETE' 
+       OR (status = 'RESERVED' AND created_at < datetime('now', '-5 minutes'))
+       OR (status = 'CLEANING' AND cleanup_lease_expires_at IS NOT NULL AND cleanup_lease_expires_at < datetime('now'))
+     );
    ```
-   **Verification of Affected Rows:** The sweeper inspects `changes`. If `changes === 0`, another worker claimed the record or it changed state. The sweeper **skips** the row and touches nothing in R2.
-3. **External R2 Mutation:**
-   Only the single worker that acquired `changes === 1` performs `deletePhoto(r2, r2Key)`.
-4. **Conditional D1 Purge or Failure Reversion:**
-   - On R2 Success:
-     ```sql
-     DELETE FROM job_photos 
-     WHERE id = :id AND status = 'CLEANING' AND cleanup_worker_id = :workerId;
-     ```
-   - On R2 Failure:
-     ```sql
-     UPDATE job_photos 
-     SET status = 'PENDING_DELETE', 
-         cleanup_attempts = cleanup_attempts + 1, 
-         last_cleanup_error = :err,
-         cleanup_worker_id = NULL
-     WHERE id = :id AND status = 'CLEANING' AND cleanup_worker_id = :workerId;
-     ```
+   Only if `changes === 1` does the worker proceed to external R2 mutations.
+3. **Lease Renewal:** If an external operation is slow, `renewPhotoCleanupLease()` extends `cleanup_lease_expires_at = datetime('now', '+2 minutes')` using matching `worker_id` and `generation`.
+4. **Conditional Deletion (Fencing Out Stale Workers):**
+   ```sql
+   DELETE FROM job_photos 
+   WHERE id = :id 
+     AND status = 'CLEANING' 
+     AND cleanup_worker_id = :workerId 
+     AND cleanup_generation = :gen;
+   ```
+   If a worker's R2 operation outlives the 2-minute lease and another worker claims generation `gen + 1`, the stale worker's `DELETE` statement matches 0 rows. It cannot delete or overwrite the newer generation.
 
 ---
 
-## 3. P1-03: Persistent Idempotency Key Lifecycle & Retries
+## 3. Persistent Immutable Payment Operations
 
-### Unresolved Operation Persistence
-- **Client Storage Key:** When a user initiates a payment operation (e.g. 1-Click Retainer Collect), the client checks `localStorage` for `parity_pending_pay_${jobId}_${period}`.
-- **Unresolved Retries:** If a request times out, the page is reloaded, or network response is dropped after server insertion, the retry uses the **identical persisted idempotency key**.
-- **Material Replay Validation:** The server compares all material parameters (`amount`, `parts_cost`, `payment_type`, `billing_period`, `note`). If matching, the existing payment is returned with `isIdempotentReplay: true`. If conflicting, HTTP 409 is returned.
-- **Confirmed Resolution:** Upon receiving a confirmed HTTP 200/201 response, `localStorage.removeItem()` is called. A subsequent payment click for the same month generates a new operation key, fully supporting legitimate multiple partial collections.
+### Full Operation Persistence
+`src/lib/payment-client.ts` stores the **entire immutable payment intent** in client storage under `parity_pending_pay_op_${jobId}_${billingPeriod}`:
+```ts
+{
+  jobId: number,
+  amount: number,
+  partsCost: number,
+  paymentType: "RETAINER_CYCLE",
+  billingPeriod: "2026-10",
+  note: string,
+  idempotencyKey: string,
+  createdAt: number
+}
+```
+
+### Invariant Rules:
+1. **Retry Stability:** When retrying after a network drop, timeout, or page reload, `executePaymentWithRetry` extracts and resends the exact stored payload (`amount`, `partsCost`, `note`, `idempotencyKey`). Any UI balance changes that occurred while the request was in flight do not alter the retried payload.
+2. **No Silent Discard on 409:** If HTTP 409 occurs, the client does not delete the operation. Instead, it queries the server reconciliation endpoint (`GET /api/jobs/${jobId}/payments?idempotency_key=...`). If the payment was already recorded, it resolves successfully; otherwise, it reports the conflict for explicit user action.
+3. **Intentional Partial Payments:** Only after an operation is confirmed resolved (or explicitly cancelled) is its storage cleared. A subsequent payment click generates a fresh operation, cleanly supporting multiple partial payments within the same billing period.
 
 ---
 
-## 4. Migration Safety & Surplus Photo Retention
+## 4. Migration Safety & Surplus Retention
 
-### Upgrade Path (`migrations/0002_remediation.sql`)
-1. Add columns `slot_number`, `status`, `cleanup_attempts`, `last_cleanup_error`, `cleanup_worker_id`, `cleanup_generation`, and `idempotency_key`.
-2. Deterministically backfill `slot_number` (1..5) using `ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY id ASC)` for the first 5 photos per job.
-3. **Zero Customer Data Loss:** Preexisting photos beyond quota ($rnum > 5$) remain `status = 'ACTIVE'` with `slot_number = NULL`. They are **never** automatically marked for deletion.
-4. **Quota Protection:** Subsequent uploads evaluate `COUNT(*) WHERE status IN ('ACTIVE', 'RESERVED')`. If active count $\ge 5$, new uploads are rejected until the user explicitly deletes existing photos below quota.
+### Invariant Policy
+- Historical customer photos from pre-remediation schemas are **never deleted automatically**.
+- In `migrations/0002_remediation.sql`, existing photos beyond 5 per job are preserved with `status = 'ACTIVE'` and `slot_number = NULL`.
+- Quota is strictly enforced on new uploads: `validatePhotoUploadQuota()` evaluates total active/reserved photos. If count $\ge 5$, new uploads are rejected.

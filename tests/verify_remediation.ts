@@ -18,6 +18,7 @@ import {
   markPhotoForDeletion,
   finalizePhotoDeletion,
   cleanupOrphanedPhotos,
+  renewPhotoCleanupLease,
   getJobPhotos,
   getJobPhotoById,
   validatePhotoUploadQuota,
@@ -37,10 +38,15 @@ import {
   getPhoto,
   deletePhoto,
   listPhotos,
+  listPhotosPaginated,
   reconcileR2Storage,
   clearMemoryStorage,
 } from "../src/lib/storage";
-import { executePaymentWithRetry } from "../src/lib/payment-client";
+import {
+  executePaymentWithRetry,
+  getPendingPaymentOperation,
+  cancelPendingPaymentOperation,
+} from "../src/lib/payment-client";
 
 /**
  * Lightweight in-memory D1 mock with SQL query counting
@@ -412,56 +418,136 @@ async function runRemediationVerification() {
 
   // 6. The upload handler crashes / terminates without compensation!
   // At this point, R2 contains lateKey, but D1 has no row.
-  // Verify that an asynchronous storage reconciler detects and purges this orphan!
+  // Test safe orphan eligibility predicate:
+  // Setup 4 companion photos in R2 to verify in-progress / active operations are NEVER purged:
+  const keyActive = `users/${user1.id}/jobs/${job1.id}/pred-active.webp`;
+  const keyReserved = `users/${user1.id}/jobs/${job1.id}/pred-reserved.webp`;
+  const keyCleaning = `users/${user1.id}/jobs/${job1.id}/pred-cleaning.webp`;
+  const keyPending = `users/${user1.id}/jobs/${job1.id}/pred-pending.webp`;
+
+  await putPhoto(null, keyActive, latePayload, "image/webp");
+  await putPhoto(null, keyReserved, latePayload, "image/webp");
+  await putPhoto(null, keyCleaning, latePayload, "image/webp");
+  await putPhoto(null, keyPending, latePayload, "image/webp");
+
+  sqlite.prepare("INSERT INTO job_photos (job_id, user_id, r2_key, status) VALUES (?, ?, ?, 'ACTIVE')").run(job1.id, user1.id, keyActive);
+  sqlite.prepare("INSERT INTO job_photos (job_id, user_id, r2_key, status) VALUES (?, ?, ?, 'RESERVED')").run(job1.id, user1.id, keyReserved);
+  sqlite.prepare("INSERT INTO job_photos (job_id, user_id, r2_key, status) VALUES (?, ?, ?, 'CLEANING')").run(job1.id, user1.id, keyCleaning);
+  sqlite.prepare("INSERT INTO job_photos (job_id, user_id, r2_key, status) VALUES (?, ?, ?, 'PENDING_DELETE')").run(job1.id, user1.id, keyPending);
+
+  // Run reconciler:
   const reconcileResult = await reconcileR2Storage(null, db, {
     prefix: `users/${user1.id}/jobs/${job1.id}/`,
     safetyGracePeriodMs: 0,
   });
+
+  // ONLY the truly unreferenced lateKey must be deleted!
   assert.ok(reconcileResult.deletedOrphans.includes(lateKey), "Reconciler MUST find and purge late-written orphan");
+  assert.strictEqual(reconcileResult.deletedOrphans.includes(keyActive), false, "ACTIVE photo MUST NOT be deleted");
+  assert.strictEqual(reconcileResult.deletedOrphans.includes(keyReserved), false, "RESERVED photo MUST NOT be deleted");
+  assert.strictEqual(reconcileResult.deletedOrphans.includes(keyCleaning), false, "CLEANING photo MUST NOT be deleted");
+  assert.strictEqual(reconcileResult.deletedOrphans.includes(keyPending), false, "PENDING_DELETE photo MUST NOT be deleted");
+
   const postReconcile = await getPhoto(null, lateKey);
   assert.strictEqual(postReconcile, null, "Late-written R2 orphan successfully eliminated from storage");
-  console.log("  ✓ P0-01: Late R2 PUT fault injection verified; storage reconciler guaranteed zero orphans");
+  assert.ok((await getPhoto(null, keyActive)) !== null, "ACTIVE photo intact in storage");
+  assert.ok((await getPhoto(null, keyReserved)) !== null, "RESERVED photo intact in storage");
+  assert.ok((await getPhoto(null, keyCleaning)) !== null, "CLEANING photo intact in storage");
+  assert.ok((await getPhoto(null, keyPending)) !== null, "PENDING_DELETE photo intact in storage");
+  console.log("  ✓ P0-01: Safe orphan eligibility predicate strictly preserves ACTIVE, RESERVED, CLEANING, and PENDING_DELETE");
+
+  // Clean up temporary predicate rows in D1 and storage
+  sqlite.prepare("DELETE FROM job_photos WHERE r2_key IN (?, ?, ?, ?)").run(keyActive, keyReserved, keyCleaning, keyPending);
+  await deletePhoto(null, keyActive);
+  await deletePhoto(null, keyReserved);
+  await deletePhoto(null, keyCleaning);
+  await deletePhoto(null, keyPending);
+
+  // Test R2 Listing Pagination with continuation cursor
+  for (let i = 1; i <= 7; i++) {
+    await putPhoto(null, `users/${user1.id}/jobs/${job1.id}/page-test-${i}.webp`, latePayload, "image/webp");
+  }
+  const page1 = await listPhotosPaginated(null, { prefix: `users/${user1.id}/jobs/${job1.id}/page-test-`, limit: 3 });
+  assert.strictEqual(page1.objects.length, 3);
+  assert.strictEqual(page1.truncated, true);
+  assert.ok(page1.cursor !== undefined);
+
+  const page2 = await listPhotosPaginated(null, { prefix: `users/${user1.id}/jobs/${job1.id}/page-test-`, cursor: page1.cursor, limit: 3 });
+  assert.strictEqual(page2.objects.length, 3);
+  assert.strictEqual(page2.truncated, true);
+
+  const page3 = await listPhotosPaginated(null, { prefix: `users/${user1.id}/jobs/${job1.id}/page-test-`, cursor: page2.cursor, limit: 3 });
+  assert.strictEqual(page3.objects.length, 1);
+  assert.strictEqual(page3.truncated, false);
+  console.log("  ✓ P0-01: R2 listing pagination using continuation cursor verified");
+
+  // Clean up page test photos
+  for (let i = 1; i <= 7; i++) {
+    await deletePhoto(null, `users/${user1.id}/jobs/${job1.id}/page-test-${i}.webp`);
+  }
 
   // =========================================================================
-  // P0-02 CONCURRENCY TEST: Simultaneous Sweepers & Atomic CAS Leases
+  // P0-02 CONCURRENCY TEST: Sweeper Lease Semantics, Expiry & Fencing
   // =========================================================================
-  console.log("\n▶ Testing P0-02: Simultaneous Sweepers & Atomic CAS State Transitions...");
+  console.log("\n▶ Testing P0-02: Sweeper Lease Semantics, Expiry & Generation Fencing...");
 
   const dummyR2Key = `users/${user1.id}/jobs/${job1.id}/concurrent-test.webp`;
   await putPhoto(null, dummyR2Key, latePayload, "image/webp");
-  const photoForCAS = await createJobPhoto(db, user1.id, job1.id, dummyR2Key);
-  await markPhotoForDeletion(db, user1.id, job1.id, photoForCAS.id);
 
-  // Simulate Sweeper 1 and Sweeper 2 running concurrently on the exact same row:
-  // Sweeper 1 claims the lease via atomic CAS with worker ID 'worker-1'
+  // Create a historical photo row created 3 days ago
+  const insertOld = sqlite.prepare(`
+    INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at)
+    VALUES (?, ?, ?, 'PENDING_DELETE', datetime('now', '-3 days'))
+    RETURNING id
+  `).get(job1.id, user1.id, dummyR2Key) as any;
+  const oldPhotoId = insertOld.id;
+
+  // 1. Sweeper 1 claims the lease: cleanup_lease_expires_at is set to now + 2 minutes
+  const sweep1Result = await cleanupOrphanedPhotos(db, null, user1.id, "worker-1");
+  // Sweeper 1 succeeds in claiming and cleaning
+  assert.strictEqual(sweep1Result.cleanedCount, 1);
+
+  // 2. Re-create historical photo to test concurrent lease stealing protection
+  const insertStealTest = sqlite.prepare(`
+    INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at)
+    VALUES (?, ?, ?, 'PENDING_DELETE', datetime('now', '-3 days'))
+    RETURNING id
+  `).get(job1.id, user1.id, dummyR2Key) as any;
+  const stealPhotoId = insertStealTest.id;
+
+  // Sweeper 1 acquires lease with generation 1 and lease_expires_at = now + 2m
   const claimRes1 = await db.prepare(
     `UPDATE job_photos 
-     SET status = 'CLEANING', cleanup_worker_id = 'worker-1', cleanup_generation = cleanup_generation + 1 
+     SET status = 'CLEANING', cleanup_worker_id = 'worker-1', cleanup_generation = 1, cleanup_lease_expires_at = datetime('now', '+2 minutes')
      WHERE id = ? AND status = 'PENDING_DELETE'`
-  ).bind(photoForCAS.id).run();
-  assert.strictEqual((claimRes1 as any).changes, 1, "Sweeper 1 successfully acquired exclusive lease");
+  ).bind(stealPhotoId).run();
+  assert.strictEqual((claimRes1 as any).changes, 1, "Sweeper 1 acquired lease");
 
-  // Sweeper 2 attempts CAS claim on the SAME row concurrently -> MUST get 0 affected rows
-  const claimRes2 = await db.prepare(
-    `UPDATE job_photos 
-     SET status = 'CLEANING', cleanup_worker_id = 'worker-2', cleanup_generation = cleanup_generation + 1 
-     WHERE id = ? AND status = 'PENDING_DELETE'`
-  ).bind(photoForCAS.id).run();
-  assert.strictEqual((claimRes2 as any).changes, 0, "Sweeper 2's affected count MUST be 0 (CAS collision)");
+  // Sweeper 2 runs 1 second later: CANNOT steal the lease on this historical record because lease_expires_at is active!
+  const sweep2Try = await cleanupOrphanedPhotos(db, null, user1.id, "worker-2");
+  assert.strictEqual(sweep2Try.cleanedCount, 0);
+  assert.strictEqual(sweep2Try.skippedCount, 0, "Sweeper 2 does not even target active lease");
+  console.log("  ✓ P0-02: Immediate lease stealing on historical records strictly prevented");
 
-  // Stale Sweeper 2 attempts deletion without holding lease -> MUST fail
-  const staleDeleteRes = await db.prepare(
-    `DELETE FROM job_photos WHERE id = ? AND status = 'CLEANING' AND cleanup_worker_id = 'worker-2'`
-  ).bind(photoForCAS.id).run();
-  assert.strictEqual((staleDeleteRes as any).changes, 0, "Stale sweeper 2 CANNOT delete row without holding lease");
+  // 3. Test Lease Renewal
+  const renewed = await renewPhotoCleanupLease(db, stealPhotoId, "worker-1", 1, 5);
+  assert.strictEqual(renewed, true, "Lease successfully renewed by owner");
 
-  // Legitimate Sweeper 1 completes external R2 deletion and purges D1 row
-  await deletePhoto(null, dummyR2Key);
-  const legitDeleteRes = await db.prepare(
-    `DELETE FROM job_photos WHERE id = ? AND status = 'CLEANING' AND cleanup_worker_id = 'worker-1'`
-  ).bind(photoForCAS.id).run();
-  assert.strictEqual((legitDeleteRes as any).changes, 1, "Lease holder Sweeper 1 successfully purged D1 row");
-  console.log("  ✓ P0-02: Simultaneous sweepers and atomic CAS lease ownership verified");
+  // 4. Test Lease Expiration and Takeover:
+  // Fast-forward lease expiry into the past (-10 seconds)
+  sqlite.prepare("UPDATE job_photos SET cleanup_lease_expires_at = datetime('now', '-10 seconds') WHERE id = ?").run(stealPhotoId);
+
+  // Sweeper 2 runs now -> Acquires expired lease and increments generation to 2!
+  const sweep2Result = await cleanupOrphanedPhotos(db, null, user1.id, "worker-2");
+  assert.strictEqual(sweep2Result.cleanedCount, 1, "Sweeper 2 took over expired lease");
+
+  // 5. Test Stale Worker Fencing:
+  // Stale Sweeper 1 (generation 1) attempts to finalize/delete -> MUST fail
+  const staleDelRes = await db.prepare(
+    `DELETE FROM job_photos WHERE id = ? AND status = 'CLEANING' AND cleanup_worker_id = 'worker-1' AND cleanup_generation = 1`
+  ).bind(stealPhotoId).run();
+  assert.strictEqual((staleDelRes as any).changes, 0, "Stale worker CANNOT finalize or delete newer generation");
+  console.log("  ✓ P0-02: Sweeper lease expiry, renewal, and generation fencing verified");
 
   // =========================================================================
   // 7. DATA-03 & BLOCKER 3: Retainer Multiple Partial Payments & Replay Matching
@@ -579,7 +665,21 @@ async function runRemediationVerification() {
   };
 
   let callCount = 0;
-  const mockFetchWithLostResponse = async (url: string, init: any) => {
+  const mockFetchWithLostResponse = async (url: string, init?: any) => {
+    const parsedUrl = new URL(url, "http://localhost:5173");
+    if (init?.method === "GET" || (!init?.method && !init?.body)) {
+      const key = parsedUrl.searchParams.get("idempotency_key");
+      if (key) {
+        const payments = await getJobPayments(db, user1.id, retainerJob.id);
+        const match = payments.find((p) => p.idempotency_key === key);
+        return new Response(JSON.stringify({ payment: match || null }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ error: "Not found" }), { status: 404 });
+    }
+
     callCount++;
     const payload = JSON.parse(init.body);
     
@@ -609,7 +709,7 @@ async function runRemediationVerification() {
   const attempt1 = await executePaymentWithRetry({
     jobId: retainerJob.id,
     amount: 1000,
-    partsCost: 0,
+    partsCost: 75,
     paymentType: "RETAINER_CYCLE",
     billingPeriod: "2026-11",
     note: "November Collection",
@@ -619,25 +719,32 @@ async function runRemediationVerification() {
 
   assert.strictEqual(attempt1.ok, false);
   assert.ok(attempt1.error?.includes("dropped"));
-  // Key MUST remain persisted in client storage!
-  const persistedKey = mockStorage.getItem(`parity_pending_pay_${retainerJob.id}_2026-11`);
-  assert.ok(persistedKey !== null, "Idempotency key must remain in storage after network failure");
-  assert.strictEqual(persistedKey, attempt1.idempotencyKey);
 
-  // Attempt 2: User retries with page reload or click
+  // The full immutable operation MUST remain persisted in client storage!
+  const pendingOp = getPendingPaymentOperation(mockStorage, retainerJob.id, "2026-11");
+  assert.ok(pendingOp !== null, "Complete operation must remain persisted in storage after network failure");
+  assert.strictEqual(pendingOp.amount, 1000);
+  assert.strictEqual(pendingOp.partsCost, 75);
+  assert.strictEqual(pendingOp.note, "November Collection");
+  assert.strictEqual(pendingOp.idempotencyKey, attempt1.operation.idempotencyKey);
+
+  // Attempt 2: User retries after page reload or balance shift in UI (e.g. caller passes amount: 0 or partsCost: 999)
+  // executePaymentWithRetry MUST use the immutable persisted operation parameters!
   const attempt2 = await executePaymentWithRetry({
     jobId: retainerJob.id,
-    amount: 1000,
-    partsCost: 0,
+    amount: 0, // Drifted UI balance
+    partsCost: 999, // Drifted UI state
     paymentType: "RETAINER_CYCLE",
     billingPeriod: "2026-11",
-    note: "November Collection",
+    note: "Drifted note",
     storage: mockStorage,
     fetchFn: mockFetchWithLostResponse as any,
   });
 
   assert.strictEqual(attempt2.ok, true);
-  assert.strictEqual(attempt2.idempotencyKey, attempt1.idempotencyKey, "Retry used IDENTICAL idempotency key");
+  assert.strictEqual(attempt2.operation.amount, 1000, "Retry preserved original immutable amount despite UI drift");
+  assert.strictEqual(attempt2.operation.partsCost, 75, "Retry preserved original immutable partsCost");
+  assert.strictEqual(attempt2.operation.idempotencyKey, attempt1.operation.idempotencyKey, "Retry used IDENTICAL idempotency key");
   assert.strictEqual(attempt2.data.payment.isIdempotentReplay, true, "Server recognized idempotent replay");
 
   // Verify D1 has EXACTLY ONE payment for 2026-11!
@@ -645,10 +752,64 @@ async function runRemediationVerification() {
   assert.strictEqual(novPayments.length, 1, "Only ONE payment record created despite network drop and retry");
 
   // Storage key must be cleared on success
-  assert.strictEqual(mockStorage.getItem(`parity_pending_pay_${retainerJob.id}_2026-11`), null);
+  assert.strictEqual(getPendingPaymentOperation(mockStorage, retainerJob.id, "2026-11"), null);
+
+  // Attempt 3: 409 Conflict Server-Side Reconciliation Check
+  // Simulate server receiving payment, but upstream proxy returning 409 Conflict
+  let call409Count = 0;
+  const mockFetchWith409Reconcile = async (url: string, init?: any) => {
+    const parsedUrl = new URL(url, "http://localhost:5173");
+    if (parsedUrl.searchParams.has("idempotency_key")) {
+      const key = parsedUrl.searchParams.get("idempotency_key")!;
+      const payments = await getJobPayments(db, user1.id, retainerJob.id);
+      const match = payments.find((p) => p.idempotency_key === key);
+      return new Response(JSON.stringify({ payment: match || null }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const payload = JSON.parse(init.body);
+    call409Count++;
+    if (call409Count === 1) {
+      // Simulate that the payment actually got committed in D1
+      await addJobPayment(db, user1.id, {
+        jobId: retainerJob.id,
+        amount: payload.amount,
+        partsCost: payload.parts_cost || 0,
+        paymentType: payload.payment_type,
+        billingPeriod: payload.billing_period,
+        note: payload.note,
+        idempotencyKey: payload.idempotency_key,
+      });
+      // But return 409 Conflict
+      return new Response(JSON.stringify({ error: "IDEMPOTENCY_CONFLICT" }), {
+        status: 409,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    return new Response(JSON.stringify({ success: true }), { status: 200 });
+  };
+
+  const attempt409 = await executePaymentWithRetry({
+    jobId: retainerJob.id,
+    amount: 1200,
+    partsCost: 0,
+    paymentType: "RETAINER_CYCLE",
+    billingPeriod: "2026-12",
+    note: "December Collection",
+    storage: mockStorage,
+    fetchFn: mockFetchWith409Reconcile as any,
+  });
+
+  // Client caught 409, invoked GET reconciliation endpoint, found payment in D1, and resolved!
+  assert.strictEqual(attempt409.ok, true, "409 successfully reconciled against server status");
+  assert.strictEqual(attempt409.data.payment.amount, 1200);
+  assert.strictEqual(getPendingPaymentOperation(mockStorage, retainerJob.id, "2026-12"), null, "Cleared from storage on reconciliation");
 
   // Next payment click generates a NEW operation key for a second partial payment
-  const attempt3 = await executePaymentWithRetry({
+  const attemptNextPartial = await executePaymentWithRetry({
     jobId: retainerJob.id,
     amount: 500,
     partsCost: 0,
@@ -658,12 +819,12 @@ async function runRemediationVerification() {
     storage: mockStorage,
     fetchFn: mockFetchWithLostResponse as any,
   });
-  assert.strictEqual(attempt3.ok, true);
-  assert.notStrictEqual(attempt3.idempotencyKey, attempt1.idempotencyKey, "New partial payment received distinct key");
+  assert.strictEqual(attemptNextPartial.ok, true);
+  assert.notStrictEqual(attemptNextPartial.operation.idempotencyKey, attempt1.operation.idempotencyKey, "New partial payment received distinct key");
 
   const novPaymentsTotal = (await getJobPayments(db, user1.id, retainerJob.id)).filter(p => p.billing_period === "2026-11");
-  assert.strictEqual(novPaymentsTotal.length, 2, "Two distinct partial payments recorded");
-  console.log("  ✓ P1-03: Lost-response client retry persistence and distinct partial collections verified");
+  assert.strictEqual(novPaymentsTotal.length, 2, "Two distinct partial payments recorded for November");
+  console.log("  ✓ P1-03: Immutable operation persistence, balance drift immunity, 409 reconciliation, and subsequent partial payments verified");
 
   // =========================================================================
   // 8. BLOCKER 4: Migration Compatibility & Deterministic Backfill

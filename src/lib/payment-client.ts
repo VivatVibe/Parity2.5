@@ -1,12 +1,25 @@
 /**
- * Client-side payment executor with persisted idempotency key retry.
- * Handles lost network responses, server errors, and genuine partial payments.
+ * Client-side payment executor with persisted immutable operation retry.
+ * Guarantees that unconfirmed payments retry with their exact original payload,
+ * survives network timeouts, page reloads, and balance shifts,
+ * and reconciles against the server without silent discarding.
  */
 
 export interface StorageLike {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
   removeItem(key: string): void;
+}
+
+export interface PersistedPaymentOperation {
+  jobId: number;
+  amount: number;
+  partsCost: number;
+  paymentType: "DEPOSIT" | "MILESTONE" | "FINAL" | "RETAINER_CYCLE";
+  billingPeriod?: string;
+  note?: string;
+  idempotencyKey: string;
+  createdAt: number;
 }
 
 export interface PaymentExecutionOptions {
@@ -20,12 +33,39 @@ export interface PaymentExecutionOptions {
   fetchFn: (url: string, init: any) => Promise<Response>;
 }
 
+export function getPendingPaymentOperation(
+  storage: StorageLike | null | undefined,
+  jobId: number,
+  billingPeriod?: string
+): PersistedPaymentOperation | null {
+  if (!storage) return null;
+  const storageKey = `parity_pending_pay_op_${jobId}_${billingPeriod || "single"}`;
+  const raw = storage.getItem(storageKey);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+export function cancelPendingPaymentOperation(
+  storage: StorageLike | null | undefined,
+  jobId: number,
+  billingPeriod?: string
+): void {
+  if (!storage) return;
+  const storageKey = `parity_pending_pay_op_${jobId}_${billingPeriod || "single"}`;
+  storage.removeItem(storageKey);
+}
+
 export async function executePaymentWithRetry(options: PaymentExecutionOptions): Promise<{
   ok: boolean;
   status: number;
   data?: any;
   error?: string;
-  idempotencyKey: string;
+  isConflict?: boolean;
+  operation: PersistedPaymentOperation;
 }> {
   const {
     jobId,
@@ -38,54 +78,125 @@ export async function executePaymentWithRetry(options: PaymentExecutionOptions):
     fetchFn,
   } = options;
 
-  const storageKey = `parity_pending_pay_${jobId}_${billingPeriod || "single"}`;
-  let idempotencyKey = storage ? storage.getItem(storageKey) : null;
+  const storageKey = `parity_pending_pay_op_${jobId}_${billingPeriod || "single"}`;
+  let persistedOp: PersistedPaymentOperation | null = null;
 
-  if (!idempotencyKey) {
+  if (storage) {
+    const raw = storage.getItem(storageKey);
+    if (raw) {
+      try {
+        persistedOp = JSON.parse(raw);
+      } catch {
+        persistedOp = null;
+      }
+    }
+  }
+
+  // If no unresolved operation exists, create and persist a new immutable operation
+  if (!persistedOp) {
     const opId =
       typeof crypto !== "undefined" && crypto.randomUUID
         ? crypto.randomUUID()
         : `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-    idempotencyKey = `pay-${jobId}-${billingPeriod || "single"}-${opId}`;
+
+    persistedOp = {
+      jobId,
+      amount,
+      partsCost,
+      paymentType,
+      billingPeriod,
+      note,
+      idempotencyKey: `pay-${jobId}-${billingPeriod || "single"}-${opId}`,
+      createdAt: Date.now(),
+    };
+
     if (storage) {
-      storage.setItem(storageKey, idempotencyKey);
+      storage.setItem(storageKey, JSON.stringify(persistedOp));
     }
   }
 
+  // Always use the immutable persisted operation parameters for retries,
+  // preventing balance shifts or reload drift from mutating the in-flight request
+  const opToExecute = persistedOp;
+
   try {
-    const res = await fetchFn(`/api/jobs/${jobId}/payments`, {
+    const res = await fetchFn(`/api/jobs/${opToExecute.jobId}/payments`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Idempotency-Key": idempotencyKey,
+        "Idempotency-Key": opToExecute.idempotencyKey,
       },
       body: JSON.stringify({
-        amount,
-        parts_cost: partsCost,
-        payment_type: paymentType,
-        billing_period: billingPeriod,
-        note,
-        idempotency_key: idempotencyKey,
+        amount: opToExecute.amount,
+        parts_cost: opToExecute.partsCost,
+        payment_type: opToExecute.paymentType,
+        billing_period: opToExecute.billingPeriod,
+        note: opToExecute.note,
+        idempotency_key: opToExecute.idempotencyKey,
       }),
     });
 
     const body = await res.json().catch(() => ({}));
 
     if (res.ok) {
-      // Confirmed resolved! Clear pending key so subsequent operations generate a new key
+      // Confirmed resolved on server! Clear operation from storage
       if (storage) {
         storage.removeItem(storageKey);
       }
-      return { ok: true, status: res.status, data: body, idempotencyKey };
-    } else {
-      // If 409 conflict, clear the key so client can start a fresh operation
-      if (res.status === 409 && storage) {
-        storage.removeItem(storageKey);
-      }
-      return { ok: false, status: res.status, error: body.error || "Payment failed", idempotencyKey };
+      return { ok: true, status: res.status, data: body, operation: opToExecute };
     }
+
+    if (res.status === 409) {
+      // Reconcile against server: check if payment was committed under this idempotencyKey
+      try {
+        const checkRes = await fetchFn(
+          `/api/jobs/${opToExecute.jobId}/payments?idempotency_key=${encodeURIComponent(
+            opToExecute.idempotencyKey
+          )}`,
+          { method: "GET" }
+        );
+        if (checkRes.ok) {
+          const checkData = await checkRes.json();
+          if (checkData.payment) {
+            // Already committed on server! Safely resolve and clear storage.
+            if (storage) {
+              storage.removeItem(storageKey);
+            }
+            return {
+              ok: true,
+              status: 200,
+              data: { success: true, payment: checkData.payment, isIdempotentReplay: true },
+              operation: opToExecute,
+            };
+          }
+        }
+      } catch {
+        // Reconciliation network check failed; retain operation for recovery
+      }
+
+      // Do NOT silently delete on unresolved 409 conflict. Retain for explicit inspection.
+      return {
+        ok: false,
+        status: 409,
+        isConflict: true,
+        error: body.error || "Idempotency conflict",
+        operation: opToExecute,
+      };
+    }
+
+    return {
+      ok: false,
+      status: res.status,
+      error: body.error || "Payment failed",
+      operation: opToExecute,
+    };
   } catch (err: any) {
-    // Uncertain network response or timeout: key remains in storage for retry!
-    return { ok: false, status: 0, error: err.message || "Network error", idempotencyKey };
+    // Network drop or timeout: operation remains persisted in storage for safe retry
+    return {
+      ok: false,
+      status: 0,
+      error: err.message || "Network error",
+      operation: opToExecute,
+    };
   }
 }

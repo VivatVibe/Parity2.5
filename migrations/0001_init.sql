@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS job_photos (
   last_cleanup_error TEXT,
   cleanup_worker_id TEXT,
   cleanup_generation INTEGER DEFAULT 0,
+  cleanup_lease_expires_at DATETIME,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(job_id, slot_number)
 );

@@ -12,6 +12,7 @@ ALTER TABLE job_photos ADD COLUMN cleanup_attempts INTEGER DEFAULT 0;
 ALTER TABLE job_photos ADD COLUMN last_cleanup_error TEXT;
 ALTER TABLE job_photos ADD COLUMN cleanup_worker_id TEXT;
 ALTER TABLE job_photos ADD COLUMN cleanup_generation INTEGER DEFAULT 0;
+ALTER TABLE job_photos ADD COLUMN cleanup_lease_expires_at DATETIME;
 
 -- 3. Deterministic Backfill of slot_number for Existing Photos (1..5 per job ordered by id ASC)
 UPDATE job_photos

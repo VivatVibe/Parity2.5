@@ -109,43 +109,72 @@ export async function deletePhoto(r2: any, key: string): Promise<void> {
 }
 
 /**
- * Lists objects in storage matching an optional key prefix.
+ * Lists objects in storage matching an optional key prefix with pagination support.
  */
-export async function listPhotos(
+export async function listPhotosPaginated(
   r2: any,
-  prefix?: string
-): Promise<{ key: string; uploaded: Date; size?: number }[]> {
+  options?: { prefix?: string; cursor?: string; limit?: number }
+): Promise<{ objects: { key: string; uploaded: Date; size?: number }[]; truncated: boolean; cursor?: string }> {
   if (r2 && typeof r2.list === "function") {
-    const listRes = await r2.list({ prefix });
-    return (listRes.objects || []).map((o: any) => ({
-      key: o.key,
-      uploaded: o.uploaded instanceof Date ? o.uploaded : new Date(o.uploaded || Date.now()),
-      size: o.size,
-    }));
+    const listRes = await r2.list({
+      prefix: options?.prefix,
+      cursor: options?.cursor,
+      limit: options?.limit || 1000,
+    });
+    return {
+      objects: (listRes.objects || []).map((o: any) => ({
+        key: o.key,
+        uploaded: o.uploaded instanceof Date ? o.uploaded : new Date(o.uploaded || Date.now()),
+        size: o.size,
+      })),
+      truncated: Boolean(listRes.truncated),
+      cursor: listRes.cursor,
+    };
   } else {
     if (process.env.NODE_ENV === "production") {
       throw new Error("Cloudflare R2 binding is required in production");
     }
-    const results: { key: string; uploaded: Date; size?: number }[] = [];
+    const all: { key: string; uploaded: Date; size?: number }[] = [];
     for (const [key, item] of memoryStore.entries()) {
-      if (!prefix || key.startsWith(prefix)) {
-        results.push({
+      if (!options?.prefix || key.startsWith(options.prefix)) {
+        all.push({
           key,
           uploaded: item.uploaded || new Date(),
           size: item.data.length,
         });
       }
     }
-    return results;
+    const startIndex = options?.cursor ? parseInt(options.cursor, 10) : 0;
+    const limit = options?.limit || 1000;
+    const sliced = all.slice(startIndex, startIndex + limit);
+    const nextIndex = startIndex + limit;
+    const truncated = nextIndex < all.length;
+    return {
+      objects: sliced,
+      truncated,
+      cursor: truncated ? String(nextIndex) : undefined,
+    };
   }
 }
 
+export async function listPhotos(
+  r2: any,
+  prefix?: string
+): Promise<{ key: string; uploaded: Date; size?: number }[]> {
+  const result = await listPhotosPaginated(r2, { prefix });
+  return result.objects;
+}
+
 /**
- * P0-01: Cross-Service Storage Reconciler.
- * Eliminates late-writer orphans created when an R2 PUT completes after a reservation
- * expired, was swept, and the upload handler crashed before compensation.
+ * P0-01: Cross-Service Storage Reconciler with Safe Orphan Eligibility Predicate.
  *
- * Any R2 object whose age exceeds safetyGracePeriodMs and has no active D1 record is purged.
+ * Guarantees and Limitations:
+ * - Orphan Eligibility: An R2 object is eligible for purging ONLY if:
+ *   1. Its creation age exceeds safetyGracePeriodMs (to protect in-flight multipart/uploads).
+ *   2. AND no record exists in D1 in ANY valid lifecycle state (ACTIVE, RESERVED, PENDING_DELETE, CLEANING).
+ * - Objects with an active D1 record (ACTIVE), in-flight upload (RESERVED), or sweeper lease (CLEANING, PENDING_DELETE)
+ *   are NEVER deleted by the reconciler.
+ * - Handles full R2 cursor pagination.
  */
 export async function reconcileR2Storage(
   r2: any,
@@ -153,35 +182,62 @@ export async function reconcileR2Storage(
   options?: {
     prefix?: string;
     safetyGracePeriodMs?: number;
+    maxObjectsToScan?: number;
   }
-): Promise<{ scannedCount: number; deletedOrphans: string[] }> {
-  const safetyGracePeriodMs = options?.safetyGracePeriodMs ?? 5 * 60 * 1000;
+): Promise<{ scannedCount: number; deletedOrphans: string[]; truncated: boolean }> {
+  const safetyGracePeriodMs = options?.safetyGracePeriodMs ?? 15 * 60 * 1000;
   const prefix = options?.prefix ?? "users/";
-  const objects = await listPhotos(r2, prefix);
-
+  let cursor: string | undefined = undefined;
+  let scannedCount = 0;
   const deletedOrphans: string[] = [];
   const now = Date.now();
+  const maxScan = options?.maxObjectsToScan ?? 10000;
 
-  for (const obj of objects) {
-    const uploadedMs = obj.uploaded ? new Date(obj.uploaded).getTime() : 0;
-    // Skip if within safety grace period so in-flight uploads can finish activating
-    if (safetyGracePeriodMs > 0 && now - uploadedMs < safetyGracePeriodMs) {
-      continue;
-    }
+  do {
+    const page = await listPhotosPaginated(r2, { prefix, cursor, limit: 1000 });
+    for (const obj of page.objects) {
+      scannedCount++;
+      const uploadedMs = obj.uploaded ? new Date(obj.uploaded).getTime() : 0;
 
-    const activePhoto = await db
-      .prepare("SELECT id FROM job_photos WHERE r2_key = ? AND status = 'ACTIVE' LIMIT 1")
-      .bind(obj.key)
-      .first<{ id: number }>();
+      // 1. In-flight grace period: Never touch recent objects
+      if (safetyGracePeriodMs > 0 && now - uploadedMs < safetyGracePeriodMs) {
+        continue;
+      }
 
-    if (!activePhoto) {
-      // Unreferenced orphan detected! Delete from R2 storage.
+      // 2. Safe orphan eligibility predicate:
+      // Query D1 for ANY record with this r2_key
+      const d1Record = await db
+        .prepare("SELECT id, status FROM job_photos WHERE r2_key = ? LIMIT 1")
+        .bind(obj.key)
+        .first<{ id: number; status: string }>();
+
+      // If record exists in ANY valid lifecycle state, DO NOT DELETE!
+      // The application or D1 sweeper owns this file.
+      if (d1Record) {
+        if (
+          d1Record.status === "ACTIVE" ||
+          d1Record.status === "RESERVED" ||
+          d1Record.status === "CLEANING" ||
+          d1Record.status === "PENDING_DELETE"
+        ) {
+          continue;
+        }
+      }
+
+      // Object has NO D1 record (or explicit FAILED status) and is older than safety grace period.
+      // It is a confirmed unreferenced orphan.
       await deletePhoto(r2, obj.key);
       deletedOrphans.push(obj.key);
     }
-  }
 
-  return { scannedCount: objects.length, deletedOrphans };
+    if (scannedCount >= maxScan) {
+      return { scannedCount, deletedOrphans, truncated: true };
+    }
+
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+
+  return { scannedCount, deletedOrphans, truncated: false };
 }
 
 export function clearMemoryStorage(): void {
