@@ -46,6 +46,15 @@ export interface JobPaymentRecord {
   note?: string;
 }
 
+export interface JobPhotoRecord {
+  id: number;
+  job_id: number;
+  user_id: number;
+  r2_key: string;
+  caption?: string;
+  created_at: string;
+}
+
 // 1. Database Schema Initialization (Idempotent)
 export async function initDatabase(db: D1Database): Promise<void> {
   const schema = `
@@ -341,20 +350,28 @@ export async function getJobFinancialSummary(
   }
 
   const totalQuotedAmount = Number(job.total_quoted_amount) || 0;
-  const balanceDue = Math.max(0, totalQuotedAmount - totalPaid);
+  let balanceDue = Math.max(0, totalQuotedAmount - totalPaid);
   const netProfit = totalPaid - totalPartsCost;
-  const isPaidInFull = totalQuotedAmount > 0 && balanceDue === 0;
+  let isPaidInFull = totalQuotedAmount > 0 && balanceDue === 0;
 
   let currentCyclePaid: boolean | undefined = undefined;
   let currentCyclePeriod: string | undefined = undefined;
 
   if (job.job_type === "RETAINER") {
-    const now = new Date();
-    const currentYearMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    const currentYearMonth = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Bangkok",
+      year: "numeric",
+      month: "2-digit",
+    }).format(new Date());
+
     currentCyclePeriod = currentYearMonth;
-    currentCyclePaid = jobPayments.some(
-      (p) => p.payment_type === "RETAINER_CYCLE" && p.billing_period === currentYearMonth
-    );
+    const currentCyclePaidAmount = jobPayments
+      .filter((p) => p.payment_type === "RETAINER_CYCLE" && p.billing_period === currentYearMonth)
+      .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+
+    currentCyclePaid = currentCyclePaidAmount >= totalQuotedAmount && totalQuotedAmount > 0;
+    balanceDue = Math.max(0, totalQuotedAmount - currentCyclePaidAmount);
+    isPaidInFull = totalQuotedAmount > 0 && balanceDue === 0;
   }
 
   return {
@@ -379,6 +396,7 @@ export async function getJobById(
       parsedMetadata?: any;
       payments: JobPaymentRecord[];
       financialSummary: JobFinancialSummary;
+      photos: JobPhotoRecord[];
     })
   | null
 > {
@@ -397,6 +415,7 @@ export async function getJobById(
   const parsedMetadata = parseJobMetadata(job.job_type, job.metadata);
   const payments = await getJobPayments(db, userId, job.id);
   const financialSummary = await getJobFinancialSummary(db, userId, job, payments);
+  const photos = await getJobPhotos(db, userId, job.id);
 
   return {
     ...job,
@@ -404,6 +423,7 @@ export async function getJobById(
     parsedMetadata,
     payments,
     financialSummary,
+    photos,
   };
 }
 
@@ -474,4 +494,109 @@ export async function getJobPayments(
     .bind(jobId, userId)
     .all<JobPaymentRecord>();
   return results || [];
+}
+
+// 7. Photo Operations (R2 Storage & 5-Photo Quota)
+export async function getJobPhotos(
+  db: D1Database,
+  userId: number,
+  jobId: number
+): Promise<JobPhotoRecord[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM job_photos WHERE job_id = ? AND user_id = ? ORDER BY id ASC")
+    .bind(jobId, userId)
+    .all<JobPhotoRecord>();
+  return results || [];
+}
+
+export async function getJobPhotosForJob(
+  db: D1Database,
+  jobId: number
+): Promise<JobPhotoRecord[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM job_photos WHERE job_id = ? ORDER BY id ASC")
+    .bind(jobId)
+    .all<JobPhotoRecord>();
+  return results || [];
+}
+
+export async function getJobPhotoById(
+  db: D1Database,
+  jobId: number,
+  photoId: number,
+  userId?: number
+): Promise<JobPhotoRecord | null> {
+  let query = "SELECT * FROM job_photos WHERE id = ? AND job_id = ?";
+  const params: any[] = [photoId, jobId];
+
+  if (userId !== undefined) {
+    query += " AND user_id = ?";
+    params.push(userId);
+  }
+
+  const photo = await db.prepare(query).bind(...params).first<JobPhotoRecord>();
+  return photo || null;
+}
+
+export async function createJobPhoto(
+  db: D1Database,
+  userId: number,
+  jobId: number,
+  r2Key: string,
+  caption?: string
+): Promise<JobPhotoRecord> {
+  // Strict Tenant Isolation: verify job exists and belongs to this user
+  const job = await db
+    .prepare("SELECT id FROM jobs WHERE id = ? AND user_id = ?")
+    .bind(jobId, userId)
+    .first<{ id: number }>();
+
+  if (!job) {
+    throw new Error(`Job ID ${jobId} not found or does not belong to user ${userId}`);
+  }
+
+  // Enforce Max 5 Photos Quota per Job
+  const countResult = await db
+    .prepare("SELECT COUNT(*) as count FROM job_photos WHERE job_id = ? AND user_id = ?")
+    .bind(jobId, userId)
+    .first<{ count: number }>();
+
+  const currentCount = countResult?.count ?? 0;
+  if (currentCount >= 5) {
+    throw new Error("อัปโหลดรูปภาพได้สูงสุด 5 รูปต่อใบงาน (Max 5 photos reached)");
+  }
+
+  const res = await db
+    .prepare(
+      "INSERT INTO job_photos (job_id, user_id, r2_key, caption) VALUES (?, ?, ?, ?) RETURNING *"
+    )
+    .bind(jobId, userId, r2Key, caption || null)
+    .first<JobPhotoRecord>();
+
+  if (!res) throw new Error("Failed to insert photo record");
+  return res;
+}
+
+export async function deleteJobPhoto(
+  db: D1Database,
+  userId: number,
+  jobId: number,
+  photoId: number
+): Promise<JobPhotoRecord> {
+  // Find photo and verify tenant ownership
+  const photo = await db
+    .prepare("SELECT * FROM job_photos WHERE id = ? AND job_id = ? AND user_id = ?")
+    .bind(photoId, jobId, userId)
+    .first<JobPhotoRecord>();
+
+  if (!photo) {
+    throw new Error(`Photo ID ${photoId} not found or does not belong to user ${userId}`);
+  }
+
+  await db
+    .prepare("DELETE FROM job_photos WHERE id = ? AND user_id = ?")
+    .bind(photoId, userId)
+    .run();
+
+  return photo;
 }

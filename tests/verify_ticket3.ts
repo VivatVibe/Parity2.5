@@ -174,21 +174,64 @@ async function runTicket3Verification() {
   assert.strictEqual(finalJob.financialSummary.isPaidInFull, true);
   console.log("  ✓ Financial Math (DEPOSIT + FINAL, partsCost deduction, netProfit, balanceDue = 0) verified");
 
-  // 5. Retainer Billing Period Tracking
-  // Record payment for cycle 2026-10
+  // 5. Retainer Billing Period Tracking & Month 2+ BalanceDue Isolation
+  // First, record a past month payment (2026-09)
   await addJobPayment(db, user1.id, {
     jobId: retainerJob.id,
     amount: 7500,
     paymentType: "RETAINER_CYCLE",
-    billingPeriod: "2026-10",
+    billingPeriod: "2026-09",
+    note: "รอบบิลกันยายน (เดือนที่แล้ว)",
+  });
+
+  // Verify that Month 1 paid DOES NOT mark Month 2 as paid
+  const currentBangkokMonth = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Bangkok",
+    year: "numeric",
+    month: "2-digit",
+  }).format(new Date());
+
+  const retainerMonth2Check = await getJobById(db, user1.id, retainerJob.id);
+  assert.ok(retainerMonth2Check !== null);
+  assert.strictEqual(
+    retainerMonth2Check.financialSummary.currentCyclePaid,
+    false,
+    "Past month payment must not mark current cycle as paid"
+  );
+  assert.strictEqual(
+    retainerMonth2Check.financialSummary.balanceDue,
+    7500,
+    "Current cycle balanceDue must equal monthlyRate when current cycle is unpaid"
+  );
+  assert.strictEqual(
+    retainerMonth2Check.financialSummary.isPaidInFull,
+    false,
+    "isPaidInFull must be false when current cycle is unpaid"
+  );
+  assert.strictEqual(
+    retainerMonth2Check.financialSummary.totalPaid,
+    7500,
+    "totalPaid must preserve cumulative lifetime payment history"
+  );
+  console.log("  ✓ Retainer Month 2+ balanceDue & isPaidInFull isolation verified");
+
+  // Now record payment for current cycle (e.g. 2026-10)
+  await addJobPayment(db, user1.id, {
+    jobId: retainerJob.id,
+    amount: 7500,
+    paymentType: "RETAINER_CYCLE",
+    billingPeriod: currentBangkokMonth,
+    note: `รอบบิลเดือนปัจจุบัน (${currentBangkokMonth})`,
   });
 
   const fetchedRetainer = await getJobById(db, user1.id, retainerJob.id);
   assert.ok(fetchedRetainer !== null);
-  assert.strictEqual(fetchedRetainer.payments.length, 1);
-  assert.strictEqual(fetchedRetainer.payments[0].billing_period, "2026-10");
+  assert.strictEqual(fetchedRetainer.payments.length, 2);
   assert.strictEqual(fetchedRetainer.financialSummary.currentCyclePaid, true);
-  console.log("  ✓ Retainer billing period (YYYY-MM) tracking verified");
+  assert.strictEqual(fetchedRetainer.financialSummary.balanceDue, 0);
+  assert.strictEqual(fetchedRetainer.financialSummary.isPaidInFull, true);
+  assert.strictEqual(fetchedRetainer.financialSummary.totalPaid, 15000);
+  console.log("  ✓ Retainer current cycle payment and cumulative totalPaid verified");
 
   // 6. Status Update Flow
   const statusUpdated = await updateJobStatus(db, user1.id, repairJob.id, "DELIVERED");

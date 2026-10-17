@@ -33,6 +33,11 @@ interface JobSlip {
     currentCyclePaid?: boolean;
     currentCyclePeriod?: string;
   };
+  photos?: Array<{
+    id: number;
+    r2_key: string;
+    caption?: string;
+  }>;
 }
 
 export default function JobSlipPage({
@@ -234,6 +239,30 @@ export default function JobSlipPage({
               </>
             )}
           </div>
+
+          {/* Condition Photos (Safe: Only image & caption, no internal notes) */}
+          {job.photos && job.photos.length > 0 && (
+            <div className="space-y-1.5 pt-1">
+              <span className="text-[10px] font-bold uppercase text-slate-400 block">
+                ภาพถ่ายสภาพอุปกรณ์ตอนรับเครื่อง ({job.photos.length} รูป)
+              </span>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                {job.photos.map((photo) => (
+                  <div key={photo.id} className="rounded-lg overflow-hidden border border-slate-200 bg-slate-50">
+                    <img
+                      src={`/api/jobs/${job.id}/photos/${photo.id}`}
+                      alt={photo.caption || "ภาพสภาพอุปกรณ์"}
+                      className="w-full aspect-video object-cover"
+                      loading="lazy"
+                    />
+                    {photo.caption && (
+                      <p className="p-1 text-[10px] text-slate-600 truncate">{photo.caption}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Financial Breakdown (Customer View) */}

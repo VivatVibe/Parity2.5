@@ -3,6 +3,7 @@
 import { useEffect, useState, use } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { compressImage } from "@/src/lib/image-compression";
 
 interface JobDetail {
   id: number;
@@ -43,6 +44,14 @@ interface JobDetail {
     currentCyclePaid?: boolean;
     currentCyclePeriod?: string;
   };
+  photos?: Array<{
+    id: number;
+    job_id: number;
+    user_id: number;
+    r2_key: string;
+    caption?: string;
+    created_at: string;
+  }>;
 }
 
 export default function JobDetailPage({
@@ -69,6 +78,13 @@ export default function JobDetailPage({
   const [paymentNote, setPaymentNote] = useState("");
   const [recordingPayment, setRecordingPayment] = useState(false);
   const [paymentError, setPaymentError] = useState<string | null>(null);
+
+  // Photo upload & management state
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
+  const [photoCaption, setPhotoCaption] = useState("");
+  const [compressionInfo, setCompressionInfo] = useState<string | null>(null);
+  const [photoError, setPhotoError] = useState<string | null>(null);
+  const [deletingPhotoId, setDeletingPhotoId] = useState<number | null>(null);
 
   const fetchJob = async () => {
     try {
@@ -161,6 +177,64 @@ export default function JobDetailPage({
       setPaymentError(err.message);
     } finally {
       setRecordingPayment(false);
+    }
+  };
+
+  // Handle photo selection, client-side canvas compression, and upload
+  const handlePhotoSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setPhotoError(null);
+    setCompressionInfo("กำลังบีบอัดรูปภาพผ่าน Canvas...");
+
+    try {
+      const compressed = await compressImage(file);
+      const originalKb = Math.round(compressed.originalSize / 1024);
+      const compressedKb = Math.round(compressed.compressedSize / 1024);
+      const savings = Math.round((1 - compressed.compressedSize / compressed.originalSize) * 100);
+      setCompressionInfo(`บีบอัดสำเร็จ: ${originalKb}KB → ${compressedKb}KB (เล็กลง ${savings}%)`);
+
+      setUploadingPhoto(true);
+      const formData = new FormData();
+      formData.append("file", compressed.blob, "photo.webp");
+      if (photoCaption.trim()) {
+        formData.append("caption", photoCaption.trim());
+      }
+
+      const res = await fetch(`/api/jobs/${jobId}/photos`, {
+        method: "POST",
+        body: formData,
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to upload photo");
+
+      setPhotoCaption("");
+      setCompressionInfo(null);
+      e.target.value = "";
+      await fetchJob();
+    } catch (err: any) {
+      setPhotoError(err.message);
+      setCompressionInfo(null);
+    } finally {
+      setUploadingPhoto(false);
+    }
+  };
+
+  const handleDeletePhoto = async (photoId: number) => {
+    if (!confirm("คุณต้องการลบรูปภาพนี้ใช่หรือไม่?")) return;
+    try {
+      setDeletingPhotoId(photoId);
+      const res = await fetch(`/api/jobs/${jobId}/photos/${photoId}`, {
+        method: "DELETE",
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to delete photo");
+      await fetchJob();
+    } catch (err: any) {
+      alert("Error: " + err.message);
+    } finally {
+      setDeletingPhotoId(null);
     }
   };
 
@@ -357,6 +431,111 @@ export default function JobDetailPage({
               </div>
             )}
           </div>
+        </div>
+
+        {/* REPAIR PHOTO GALLERY (Max 5 photos, Canvas compressed) */}
+        <div className="bg-white border border-slate-200 rounded-2xl p-5 sm:p-6 shadow-sm space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h2 className="text-base font-black text-slate-900 tracking-tight flex items-center gap-2">
+                <span>📷</span> รูปถ่ายสภาพเครื่อง / หน้างาน
+              </h2>
+              <p className="text-xs text-slate-500 mt-0.5">
+                บันทึกสภาพเครื่องก่อนแกะซ่อม บีบอัดภาพอัตโนมัติไม่กินเน็ต ({job.photos?.length ?? 0}/5 รูป)
+              </p>
+            </div>
+            <span className="text-xs font-bold font-mono px-2.5 py-1 bg-slate-100 text-slate-700 rounded-lg">
+              {job.photos?.length ?? 0} / 5
+            </span>
+          </div>
+
+          {/* Photo Error Banner */}
+          {photoError && (
+            <div className="p-3 bg-rose-50 border border-rose-200 text-rose-700 text-xs rounded-xl font-medium">
+              {photoError}
+            </div>
+          )}
+
+          {/* Photo Gallery Grid */}
+          {job.photos && job.photos.length > 0 ? (
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+              {job.photos.map((photo) => (
+                <div
+                  key={photo.id}
+                  className="group relative bg-slate-100 rounded-xl overflow-hidden border border-slate-200 flex flex-col"
+                >
+                  <div className="aspect-video w-full bg-slate-200 relative overflow-hidden">
+                    <img
+                      src={`/api/jobs/${job.id}/photos/${photo.id}`}
+                      alt={photo.caption || "ภาพสภาพอุปกรณ์"}
+                      className="w-full h-full object-cover"
+                      loading="lazy"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => handleDeletePhoto(photo.id)}
+                      disabled={deletingPhotoId === photo.id}
+                      className="absolute top-1.5 right-1.5 bg-rose-600/90 hover:bg-rose-700 text-white p-1 rounded-lg text-xs opacity-90 transition disabled:opacity-50"
+                      title="ลบรูปนี้"
+                    >
+                      {deletingPhotoId === photo.id ? "..." : "🗑️"}
+                    </button>
+                  </div>
+                  {photo.caption && (
+                    <p className="p-2 text-[11px] text-slate-700 font-medium truncate">
+                      {photo.caption}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="p-6 text-center bg-slate-50 rounded-xl border border-dashed border-slate-200 text-xs text-slate-400">
+              ยังไม่มีรูปถ่ายสภาพเครื่อง ถ่ายรูปหรือเลือกไฟล์ด้านล่างเพื่อบันทึก
+            </div>
+          )}
+
+          {/* Photo Upload Section (If quota < 5) */}
+          {(job.photos?.length ?? 0) < 5 ? (
+            <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+              <p className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                + เพิ่มรูปถ่ายใหม่ (บีบอัดอัตโนมัติ &lt; 300KB)
+              </p>
+
+              <div className="flex flex-col sm:flex-row gap-2">
+                <input
+                  type="text"
+                  placeholder="คำอธิบายภาพ เช่น รอยบุบมุมขวา, ฝุ่นในพัดลม..."
+                  value={photoCaption}
+                  onChange={(e) => setPhotoCaption(e.target.value)}
+                  className="flex-1 bg-white border border-slate-200 rounded-lg p-2 text-xs"
+                />
+
+                <label className="cursor-pointer bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs px-4 py-2 rounded-lg shadow transition flex items-center justify-center gap-1.5 whitespace-nowrap">
+                  <span>📸</span>
+                  <span>{uploadingPhoto ? "กำลังอัปโหลด..." : "ถ่ายภาพ / เลือกรูป"}</span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    capture="environment"
+                    onChange={handlePhotoSelected}
+                    disabled={uploadingPhoto}
+                    className="hidden"
+                  />
+                </label>
+              </div>
+
+              {compressionInfo && (
+                <p className="text-[11px] text-blue-600 font-medium animate-pulse">
+                  {compressionInfo}
+                </p>
+              )}
+            </div>
+          ) : (
+            <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-xl text-center font-medium">
+              ✓ บันทึกภาพครบโควตา 5 รูปแล้ว (หากต้องการเพิ่มรูปใหม่ กรุณากดปุ่ม 🗑️ ลบรูปเดิมก่อน)
+            </div>
+          )}
         </div>
 
         {/* FINANCIAL LEDGER BOX (Owner Only) */}
