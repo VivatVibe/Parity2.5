@@ -39,6 +39,7 @@
 		"test:ticket1": "tsx tests/verify_ticket1.ts",
 		"test:ticket2": "tsx tests/verify_ticket2.ts",
 		"test:ticket3": "tsx tests/verify_ticket3.ts",
-		"test:ticket4": "tsx tests/verify_ticket4.ts"
+		"test:ticket4": "tsx tests/verify_ticket4.ts",
+		"test:ticket5": "tsx tests/verify_ticket5.ts"
 	}
 }

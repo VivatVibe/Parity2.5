@@ -7,6 +7,7 @@ import {
   createClient,
   createJob,
   getJobById,
+  validatePhotoUploadQuota,
   createJobPhoto,
   getJobPhotos,
   getJobPhotoById,
@@ -129,6 +130,16 @@ async function runTicket4Verification() {
       return err.message.includes("อัปโหลดรูปภาพได้สูงสุด 5 รูปต่อใบงาน (Max 5 photos reached)");
     }
   );
+  // Validate that validatePhotoUploadQuota rejects BEFORE touching R2 (prevents orphaned files)
+  await assert.rejects(
+    async () => {
+      await validatePhotoUploadQuota(db, user1.id, job1.id);
+    },
+    (err: any) => {
+      return err.message.includes("อัปโหลดรูปภาพได้สูงสุด 5 รูปต่อใบงาน (Max 5 photos reached)");
+    }
+  );
+  console.log("  ✓ validatePhotoUploadQuota strictly prevents orphaned R2 uploads!");
   console.log("  ✓ 6th photo strictly rejected by Max 5 Quota guard!");
 
   // 4. Cross-Tenant Security Gate:

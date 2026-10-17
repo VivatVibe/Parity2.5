@@ -55,8 +55,11 @@ export interface JobPhotoRecord {
   created_at: string;
 }
 
-// 1. Database Schema Initialization (Idempotent)
+const initializedDbs = new WeakSet<D1Database>();
+
+// 1. Database Schema Initialization (Idempotent Singleton)
 export async function initDatabase(db: D1Database): Promise<void> {
+  if (initializedDbs.has(db)) return;
   const schema = `
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,6 +142,7 @@ export async function initDatabase(db: D1Database): Promise<void> {
   for (const stmt of statements) {
     await db.prepare(stmt).run();
   }
+  initializedDbs.add(db);
 }
 
 // 2. User Operations (Strictly scoped)
@@ -538,14 +542,11 @@ export async function getJobPhotoById(
   return photo || null;
 }
 
-export async function createJobPhoto(
+export async function validatePhotoUploadQuota(
   db: D1Database,
   userId: number,
-  jobId: number,
-  r2Key: string,
-  caption?: string
-): Promise<JobPhotoRecord> {
-  // Strict Tenant Isolation: verify job exists and belongs to this user
+  jobId: number
+): Promise<void> {
   const job = await db
     .prepare("SELECT id FROM jobs WHERE id = ? AND user_id = ?")
     .bind(jobId, userId)
@@ -555,7 +556,6 @@ export async function createJobPhoto(
     throw new Error(`Job ID ${jobId} not found or does not belong to user ${userId}`);
   }
 
-  // Enforce Max 5 Photos Quota per Job
   const countResult = await db
     .prepare("SELECT COUNT(*) as count FROM job_photos WHERE job_id = ? AND user_id = ?")
     .bind(jobId, userId)
@@ -565,6 +565,17 @@ export async function createJobPhoto(
   if (currentCount >= 5) {
     throw new Error("อัปโหลดรูปภาพได้สูงสุด 5 รูปต่อใบงาน (Max 5 photos reached)");
   }
+}
+
+export async function createJobPhoto(
+  db: D1Database,
+  userId: number,
+  jobId: number,
+  r2Key: string,
+  caption?: string
+): Promise<JobPhotoRecord> {
+  // Strict Tenant Isolation & Quota Check
+  await validatePhotoUploadQuota(db, userId, jobId);
 
   const res = await db
     .prepare(
@@ -599,4 +610,243 @@ export async function deleteJobPhoto(
     .run();
 
   return photo;
+}
+
+// 8. Mission Control Dashboard Aggregation (Zero N+1 Queries)
+export interface DashboardJobItem {
+  id: number;
+  user_id: number;
+  client_id: number;
+  job_number: string;
+  job_type: "REPAIR" | "PROJECT" | "RETAINER";
+  title: string;
+  status: string;
+  due_date?: string;
+  total_quoted_amount: number;
+  metadata: string;
+  created_at: string;
+  updated_at: string;
+  client: {
+    name: string;
+    phone?: string;
+    line_id?: string;
+  };
+  parsedMetadata: any;
+  totalPaid: number;
+  totalPartsCost: number;
+  balanceDue: number;
+  netProfit: number;
+  isPaidInFull: boolean;
+  currentCyclePaid?: boolean;
+  currentCyclePeriod?: string;
+  paymentProgress?: number;
+  isOverdue?: boolean;
+}
+
+export interface DashboardData {
+  kpis: {
+    activeJobsCount: number;
+    monthlyRevenue: number;
+    monthlyProfit: number;
+    unpaidBalanceDue: number;
+    currentMonth: string;
+  };
+  zones: {
+    repairs: DashboardJobItem[];
+    projects: DashboardJobItem[];
+    retainers: DashboardJobItem[];
+  };
+}
+
+export async function getDashboardData(
+  db: D1Database,
+  userId: number,
+  searchQuery?: string
+): Promise<DashboardData> {
+  const currentBangkokMonth = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Bangkok",
+    year: "numeric",
+    month: "2-digit",
+  }).format(new Date());
+
+  const todayStr = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Bangkok",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+
+  // 1. Aggregated query for monthly revenue and parts cost
+  const kpiRow = await db
+    .prepare(
+      `SELECT 
+        COALESCE(SUM(amount), 0) as monthly_revenue,
+        COALESCE(SUM(parts_cost), 0) as monthly_parts_cost
+       FROM job_payments 
+       WHERE user_id = ? AND strftime('%Y-%m', paid_at) = ?`
+    )
+    .bind(userId, currentBangkokMonth)
+    .first<{ monthly_revenue: number; monthly_parts_cost: number }>();
+
+  const monthlyRevenue = kpiRow?.monthly_revenue ?? 0;
+  const monthlyPartsCost = kpiRow?.monthly_parts_cost ?? 0;
+  const monthlyProfit = monthlyRevenue - monthlyPartsCost;
+
+  // 2. Aggregated query for all jobs with clients and payment sums (Zero N+1)
+  let jobsQuery = `
+    SELECT 
+      j.id,
+      j.user_id,
+      j.client_id,
+      j.job_number,
+      j.job_type,
+      j.title,
+      j.status,
+      j.due_date,
+      j.total_quoted_amount,
+      j.metadata,
+      j.created_at,
+      j.updated_at,
+      c.name as client_name,
+      c.phone as client_phone,
+      c.line_id as client_line_id,
+      COALESCE(SUM(p.amount), 0) as total_paid,
+      COALESCE(SUM(p.parts_cost), 0) as logged_parts_cost,
+      COALESCE(SUM(CASE WHEN p.payment_type = 'RETAINER_CYCLE' AND p.billing_period = ? THEN p.amount ELSE 0 END), 0) as current_cycle_paid_amount
+    FROM jobs j
+    LEFT JOIN clients c ON j.client_id = c.id AND c.user_id = j.user_id
+    LEFT JOIN job_payments p ON j.id = p.job_id AND p.user_id = j.user_id
+    WHERE j.user_id = ?
+  `;
+
+  const queryParams: any[] = [currentBangkokMonth, userId];
+
+  if (searchQuery && searchQuery.trim()) {
+    const q = `%${searchQuery.trim()}%`;
+    jobsQuery += ` AND (
+      j.job_number LIKE ? OR 
+      j.title LIKE ? OR 
+      c.name LIKE ? OR 
+      c.phone LIKE ? OR 
+      j.metadata LIKE ?
+    )`;
+    queryParams.push(q, q, q, q, q);
+  }
+
+  jobsQuery += ` GROUP BY j.id ORDER BY j.id DESC`;
+
+  const { results } = await db.prepare(jobsQuery).bind(...queryParams).all<any>();
+  const rows = results || [];
+
+  let activeJobsCount = 0;
+  let unpaidBalanceDue = 0;
+
+  const repairs: DashboardJobItem[] = [];
+  const projects: DashboardJobItem[] = [];
+  const retainers: DashboardJobItem[] = [];
+
+  for (const row of rows) {
+    const parsedMetadata = parseJobMetadata(row.job_type, row.metadata);
+    const totalQuoted = Number(row.total_quoted_amount) || 0;
+    const totalPaid = Number(row.total_paid) || 0;
+    const loggedPartsCost = Number(row.logged_parts_cost) || 0;
+    const currentCyclePaidAmount = Number(row.current_cycle_paid_amount) || 0;
+
+    let totalPartsCost = loggedPartsCost;
+    if (totalPartsCost === 0 && row.job_type === "REPAIR" && parsedMetadata?.partsCost) {
+      totalPartsCost = Number(parsedMetadata.partsCost) || 0;
+    }
+
+    let balanceDue = Math.max(0, totalQuoted - totalPaid);
+    let isPaidInFull = totalQuoted > 0 && balanceDue === 0;
+    let currentCyclePaid: boolean | undefined = undefined;
+
+    if (row.job_type === "RETAINER") {
+      const monthlyRate = Number(parsedMetadata?.monthlyRate) || totalQuoted;
+      currentCyclePaid = currentCyclePaidAmount >= monthlyRate && monthlyRate > 0;
+      balanceDue = Math.max(0, monthlyRate - currentCyclePaidAmount);
+      isPaidInFull = monthlyRate > 0 && balanceDue === 0;
+    }
+
+    const netProfit = totalPaid - totalPartsCost;
+    const isActive = row.status !== "DELIVERED" && row.status !== "CANCELLED";
+
+    if (isActive) {
+      activeJobsCount++;
+      unpaidBalanceDue += balanceDue;
+    }
+
+    const item: DashboardJobItem = {
+      id: row.id,
+      user_id: row.user_id,
+      client_id: row.client_id,
+      job_number: row.job_number,
+      job_type: row.job_type,
+      title: row.title,
+      status: row.status,
+      due_date: row.due_date || undefined,
+      total_quoted_amount: totalQuoted,
+      metadata: row.metadata,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      client: {
+        name: row.client_name || "ไม่ระบุ",
+        phone: row.client_phone || undefined,
+        line_id: row.client_line_id || undefined,
+      },
+      parsedMetadata,
+      totalPaid,
+      totalPartsCost,
+      balanceDue,
+      netProfit,
+      isPaidInFull,
+      currentCyclePaid,
+      currentCyclePeriod: currentBangkokMonth,
+    };
+
+    if (row.job_type === "REPAIR") {
+      repairs.push(item);
+    } else if (row.job_type === "PROJECT") {
+      item.paymentProgress =
+        totalQuoted > 0 ? Math.min(100, Math.round((totalPaid / totalQuoted) * 100)) : 100;
+      item.isOverdue = Boolean(
+        row.due_date && row.due_date < todayStr && row.status !== "COMPLETED" && row.status !== "DELIVERED"
+      );
+      projects.push(item);
+    } else if (row.job_type === "RETAINER") {
+      retainers.push(item);
+    }
+  }
+
+  // Sort Projects: Due Date ASC (urgent/overdue on top)
+  projects.sort((a, b) => {
+    if (!a.due_date) return 1;
+    if (!b.due_date) return -1;
+    return a.due_date.localeCompare(b.due_date);
+  });
+
+  // Sort Retainers: Unpaid on top, then by billingCycleDay
+  retainers.sort((a, b) => {
+    if (a.currentCyclePaid !== b.currentCyclePaid) {
+      return a.currentCyclePaid ? 1 : -1; // unpaid first
+    }
+    const dayA = a.parsedMetadata?.billingCycleDay || 1;
+    const dayB = b.parsedMetadata?.billingCycleDay || 1;
+    return dayA - dayB;
+  });
+
+  return {
+    kpis: {
+      activeJobsCount,
+      monthlyRevenue,
+      monthlyProfit,
+      unpaidBalanceDue,
+      currentMonth: currentBangkokMonth,
+    },
+    zones: {
+      repairs,
+      projects,
+      retainers,
+    },
+  };
 }

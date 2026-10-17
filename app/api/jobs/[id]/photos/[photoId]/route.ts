@@ -12,6 +12,9 @@ export async function GET(
     if (!env.DB) return new Response("D1 database missing", { status: 500 });
     await initDatabase(env.DB);
 
+    const session = await getCurrentUser(request);
+    if (!session) return new Response("Unauthorized", { status: 401 });
+
     const resolvedParams = await params;
     const jobId = Number(resolvedParams.id);
     const photoId = Number(resolvedParams.photoId);
@@ -20,8 +23,8 @@ export async function GET(
       return new Response("Invalid ID parameters", { status: 400 });
     }
 
-    // Allow fetching photo if it belongs to the job (accessible to owner and customer slip)
-    const photo = await getJobPhotoById(env.DB, jobId, photoId);
+    // Strictly enforce tenant ownership (WHERE id = photoId AND job_id = jobId AND user_id = session.userId)
+    const photo = await getJobPhotoById(env.DB, jobId, photoId, session.userId);
     if (!photo) {
       return new Response("Photo not found", { status: 404 });
     }

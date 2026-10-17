@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/src/lib/auth";
 import { env } from "cloudflare:workers";
-import { initDatabase, createJobPhoto, getJobPhotos } from "@/src/lib/db";
-import { putPhoto } from "@/src/lib/storage";
+import { initDatabase, validatePhotoUploadQuota, createJobPhoto, getJobPhotos } from "@/src/lib/db";
+import { putPhoto, deletePhoto } from "@/src/lib/storage";
 
 export async function GET(
   request: Request,
@@ -62,17 +62,27 @@ export async function POST(
       );
     }
 
+    // 1. Validate quota and job ownership BEFORE touching R2 (No orphaned files!)
+    await validatePhotoUploadQuota(env.DB, session.userId, jobId);
+
     const r2Key = `users/${session.userId}/jobs/${jobId}/${crypto.randomUUID()}.webp`;
     const arrayBuffer = await file.arrayBuffer();
     const buffer = new Uint8Array(arrayBuffer);
     const contentType = file.type || "image/webp";
 
-    // 1. Put into R2 (with memory fallback)
     const r2Binding = (env as any).PHOTOS || (env as any).R2;
+
+    // 2. Write to R2
     await putPhoto(r2Binding, r2Key, buffer, contentType);
 
-    // 2. Insert into D1 (Enforces < 5 quota and tenant ownership)
-    const photo = await createJobPhoto(env.DB, session.userId, jobId, r2Key, caption);
+    // 3. Insert record into D1 (with rollback cleanup if insertion fails)
+    let photo;
+    try {
+      photo = await createJobPhoto(env.DB, session.userId, jobId, r2Key, caption);
+    } catch (dbErr) {
+      await deletePhoto(r2Binding, r2Key);
+      throw dbErr;
+    }
 
     return NextResponse.json({ success: true, photo });
   } catch (error: any) {
