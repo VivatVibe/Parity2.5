@@ -918,8 +918,9 @@ export async function markPhotoSlotForCleanupRetry(
   r2Key?: string,
   jobId?: number
 ): Promise<void> {
-  // R8-A3 / R9-02: Durable failure recording.
-  // Preserves photo reference in PENDING_DELETE with diagnostic error so background sweeper retries R2 deletion.
+  // R8-A3 / R9-02 / R10-01: Lease-aware durable failure recording.
+  // Only transitions rows that are NOT actively CLEANING with a valid lease held by another worker.
+  // This prevents upload cleanup from overwriting a sweeper's active ownership.
   const res = await db
     .prepare(
       `UPDATE job_photos 
@@ -927,25 +928,50 @@ export async function markPhotoSlotForCleanupRetry(
            slot_number = NULL, 
            cleanup_attempts = COALESCE(cleanup_attempts, 0) + 1,
            last_cleanup_error = ?
-       WHERE id = ? AND user_id = ?`
+       WHERE id = ? AND user_id = ?
+         AND (
+           status != 'CLEANING'
+           OR cleanup_lease_expires_at IS NULL
+           OR cleanup_lease_expires_at < datetime('now')
+         )`
     )
     .bind(lastError, photoId, userId)
     .run();
 
   const changes = (res as any)?.changes ?? (res as any)?.meta?.changes ?? 0;
   if (changes === 0 && r2Key) {
-    // R9-02: If reservation row was already purged by sweeper (>5m), insert tombstone record
-    // with status 'PENDING_DELETE' so background sweeper still has a durable D1 row to retry R2 deletion.
+    // Distinguish: row actively owned vs row missing
+    const existing = await db
+      .prepare("SELECT id, status FROM job_photos WHERE id = ? AND user_id = ?")
+      .bind(photoId, userId)
+      .first<{ id: number; status: string }>();
+
+    if (existing) {
+      // Row exists but is actively CLEANING with a valid lease — do not overwrite.
+      // The current owner will handle cleanup; no action needed.
+      return;
+    }
+
+    // R9-02 / R10-04: Row is truly missing (purged by sweeper). Insert tombstone for durable retry.
+    // Wrapped in try/catch: if parent job is missing (FK constraint) or concurrent tombstone creation,
+    // R2 reconciler serves as the last-resort cleanup path for orphaned R2 objects.
     const derivedJobId = jobId || Number(r2Key.match(/jobs\/(\d+)\//)?.[1]) || null;
     if (derivedJobId) {
-      await db
-        .prepare(
-          `INSERT INTO job_photos (job_id, user_id, slot_number, r2_key, status, cleanup_attempts, last_cleanup_error)
-           VALUES (?, ?, NULL, ?, 'PENDING_DELETE', 1, ?)`
-        )
-        .bind(derivedJobId, userId, r2Key, `Orphan recovery: ${lastError}`)
-        .run();
+      try {
+        await db
+          .prepare(
+            `INSERT INTO job_photos (job_id, user_id, slot_number, r2_key, status, cleanup_attempts, last_cleanup_error)
+             VALUES (?, ?, NULL, ?, 'PENDING_DELETE', 1, ?)`
+          )
+          .bind(derivedJobId, userId, r2Key, `Orphan recovery: ${lastError}`)
+          .run();
+      } catch {
+        // ponytail: tombstone INSERT failed (FK violation, duplicate key, etc.).
+        // R2 reconciler will catch the orphaned R2 object after safetyGracePeriodMs expires.
+      }
     }
+    // ponytail: if derivedJobId is null or tombstone INSERT failed, the R2 object becomes an orphan
+    // that the periodic R2 reconciler (reconcileR2Storage) will purge after the 60-minute grace period.
   }
 }
 
@@ -1041,15 +1067,21 @@ export async function handlePhotoDeletionRequest(
   try {
     await deletePhoto(r2, claimedPhoto.r2_key);
   } catch (r2Err: any) {
-    // R9-03: Catch R2 deletion failure and record diagnostic metadata in D1 under current worker ownership/lease
+    // R9-03 / R10-03: Record diagnostic metadata fenced by generation, status, and active lease validity.
+    // A stale worker whose lease expired cannot overwrite a new owner's metadata.
     await db
       .prepare(
         `UPDATE job_photos 
          SET cleanup_attempts = COALESCE(cleanup_attempts, 0) + 1,
              last_cleanup_error = ?
-         WHERE id = ? AND user_id = ? AND cleanup_worker_id = ?`
+         WHERE id = ? AND user_id = ? 
+           AND status = 'CLEANING'
+           AND cleanup_worker_id = ?
+           AND cleanup_generation = ?
+           AND cleanup_lease_expires_at IS NOT NULL
+           AND cleanup_lease_expires_at >= datetime('now')`
       )
-      .bind(r2Err?.message || "R2 delete failed", photoId, userId, workerId)
+      .bind(r2Err?.message || "R2 delete failed", photoId, userId, workerId, claimedPhoto.cleanup_generation)
       .run();
 
     return {
@@ -1111,14 +1143,26 @@ export async function handlePhotoUploadActivationFailure(
     try {
       await failPhotoSlot(db, userId, slotId);
     } catch {
-      // If failPhotoSlot fails (e.g. transient D1 error or already purged), mark status to avoid stuck slot
+      // R10-02: failPhotoSlot only deletes RESERVED rows. If the row changed status
+      // (e.g. transient D1 error, or sweeper already claimed it), set PENDING_DELETE
+      // which the background sweeper already handles. R2 is already deleted, so
+      // sweeper's idempotent R2 delete is safe — it just purges the D1 metadata.
       try {
         await db
-          .prepare("UPDATE job_photos SET status = 'FAILED', slot_number = NULL WHERE id = ? AND user_id = ?")
+          .prepare(
+            `UPDATE job_photos SET status = 'PENDING_DELETE', slot_number = NULL 
+             WHERE id = ? AND user_id = ?
+               AND (
+                 status != 'CLEANING'
+                 OR cleanup_lease_expires_at IS NULL
+                 OR cleanup_lease_expires_at < datetime('now')
+               )`
+          )
           .bind(slotId, userId)
           .run();
       } catch {
-        // Safe to ignore; sweeper handles expired slots >5m
+        // ponytail: D1 is unreachable. Row stays as RESERVED and sweeper will
+        // pick it up after the 5-minute reservation expiry.
       }
     }
   }

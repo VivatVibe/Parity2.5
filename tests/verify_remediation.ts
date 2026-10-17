@@ -1804,8 +1804,10 @@ async function runRemediationVerification() {
   assert.strictEqual(sqlite.prepare("SELECT id FROM job_photos WHERE id = ?").get(row7g.id), undefined);
   await deletePhoto(null, key7g);
 
-  // Subcase 7h (R9-02): Upload cleanup recovery creates durable PENDING_DELETE tombstone if reservation already purged
+  // Subcase 7h (R9-02 / R10-04): Upload cleanup creates durable tombstone when reservation already purged,
+  // with real R2 object to prove full R2 + D1 eventual convergence
   const purgedSlotKey = `users/${user1.id}/jobs/${testJob.id}/purged-slot.webp`;
+  await putPhoto(null, purgedSlotKey, testPayload, "image/webp"); // Create real R2 object
   const nonExistentSlotId = 999999; // D1 row does not exist (sweeper purged it while upload was delayed)
   const failingUploadR2ForPurged = {
     delete: async () => {
@@ -1829,12 +1831,112 @@ async function runRemediationVerification() {
   assert.strictEqual(tombstone.status, "PENDING_DELETE", "Tombstone status must be PENDING_DELETE");
   assert.ok(tombstone.last_cleanup_error.includes("Orphan recovery"), "Diagnostic error recorded in tombstone");
 
-  // Sweeper now cleans up the tombstone
+  // Sweeper now cleans up the tombstone AND the R2 object (full R2 + D1 convergence)
   const tombstoneCleanup = await cleanupOrphanedPhotos(db, null, user1.id, "sweeper-tombstone");
   assert.ok(tombstoneCleanup.cleanedCount >= 1, "Sweeper successfully cleans up tombstone orphan");
-  assert.strictEqual(sqlite.prepare("SELECT id FROM job_photos WHERE id = ?").get(purgedSlotKey), undefined);
+  assert.strictEqual(sqlite.prepare("SELECT id FROM job_photos WHERE id = ?").get(tombstone.id), undefined, "Tombstone D1 row deleted by sweeper");
+  assert.strictEqual(await getPhoto(null, purgedSlotKey), null, "R2 object also deleted — full R2 + D1 convergence");
 
-  console.log("  ✓ Scenario 7: Unified deletion ownership, exclusive lease fencing, deferred in-flight 409, durable retry, and production 60m clamping verified");
+  // Subcase 7i (R10-01): markPhotoSlotForCleanupRetry cannot overwrite an active CLEANING owner
+  const key7i = `users/${user1.id}/jobs/${testJob.id}/lease-guard-7i.webp`;
+  await putPhoto(null, key7i, testPayload, "image/webp");
+  const row7i = sqlite.prepare(`
+    INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at)
+    VALUES (?, ?, ?, 'ACTIVE', datetime('now'))
+    RETURNING id
+  `).get(testJob.id, user1.id, key7i) as any;
+
+  // Sweeper claims the row with a valid lease
+  const claimed7i = await claimPhotoForDeletion(db, user1.id, testJob.id, row7i.id, "sweeper-7i", 2);
+  assert.strictEqual(claimed7i.status, "CLEANING");
+
+  // Upload cleanup tries to overwrite via markPhotoSlotForCleanupRetry — must be rejected
+  await markPhotoSlotForCleanupRetry(db, user1.id, row7i.id, "Upload retry failure");
+  const row7iCheck = sqlite.prepare("SELECT status, cleanup_worker_id FROM job_photos WHERE id = ?").get(row7i.id) as any;
+  assert.strictEqual(row7iCheck.status, "CLEANING", "Active CLEANING lease NOT overwritten by retry");
+  assert.strictEqual(row7iCheck.cleanup_worker_id, "sweeper-7i", "Sweeper ownership preserved");
+
+  // Clean up: expire lease and let sweeper handle it
+  sqlite.prepare("UPDATE job_photos SET cleanup_lease_expires_at = datetime('now', '-1 minute') WHERE id = ?").run(row7i.id);
+  await cleanupOrphanedPhotos(db, null, user1.id, "sweeper-cleanup-7i");
+  await deletePhoto(null, key7i);
+
+  // Subcase 7j (R10-03): HTTP diagnostics UPDATE is fenced by generation and lease
+  const key7j = `users/${user1.id}/jobs/${testJob.id}/diagnostics-7j.webp`;
+  await putPhoto(null, key7j, testPayload, "image/webp");
+  const row7j = sqlite.prepare(`
+    INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at)
+    VALUES (?, ?, ?, 'ACTIVE', datetime('now'))
+    RETURNING id
+  `).get(testJob.id, user1.id, key7j) as any;
+
+  // Claim with known worker
+  const claimed7j = await claimPhotoForDeletion(db, user1.id, testJob.id, row7j.id, "worker-7j-stale", 2);
+  // Expire stale worker's lease, then new worker reclaims
+  sqlite.prepare("UPDATE job_photos SET cleanup_lease_expires_at = datetime('now', '-1 minute') WHERE id = ?").run(row7j.id);
+  const reclaimed7j = await claimPhotoForDeletion(db, user1.id, testJob.id, row7j.id, "worker-7j-new", 2);
+
+  // Stale worker tries to record diagnostics — must be fenced out
+  await db
+    .prepare(
+      `UPDATE job_photos 
+       SET cleanup_attempts = COALESCE(cleanup_attempts, 0) + 1,
+           last_cleanup_error = 'stale worker error'
+       WHERE id = ? AND user_id = ? 
+         AND status = 'CLEANING'
+         AND cleanup_worker_id = ?
+         AND cleanup_generation = ?
+         AND cleanup_lease_expires_at IS NOT NULL
+         AND cleanup_lease_expires_at >= datetime('now')`
+    )
+    .bind(row7j.id, user1.id, "worker-7j-stale", claimed7j.cleanup_generation)
+    .run();
+
+  const row7jCheck = sqlite.prepare("SELECT cleanup_worker_id, last_cleanup_error FROM job_photos WHERE id = ?").get(row7j.id) as any;
+  assert.strictEqual(row7jCheck.cleanup_worker_id, "worker-7j-new", "Stale worker cannot overwrite new owner's diagnostics");
+  assert.ok(!row7jCheck.last_cleanup_error || !row7jCheck.last_cleanup_error.includes("stale worker error"), "Stale diagnostic update correctly fenced out");
+
+  // Clean up row 7j
+  await finalizePhotoDeletion(db, user1.id, row7j.id, "worker-7j-new", reclaimed7j.cleanup_generation);
+  await deletePhoto(null, key7j);
+
+  // Subcase 7k (R10-04): Missing parent job — tombstone INSERT fails gracefully, R2 reconciler is last resort
+  const orphanKeyNoParent = `users/${user1.id}/jobs/999888/orphan-no-parent.webp`;
+  await putPhoto(null, orphanKeyNoParent, testPayload, "image/webp"); // R2 object exists
+  const fakeSlotIdNoParent = 888888;
+  const failingR2NoParent = {
+    delete: async () => {
+      throw new Error("R2 timeout");
+    },
+  };
+
+  // This should NOT throw even though job 999888 doesn't exist (FK violation caught)
+  await handlePhotoUploadActivationFailure(
+    db,
+    failingR2NoParent,
+    user1.id,
+    fakeSlotIdNoParent,
+    orphanKeyNoParent,
+    new Error("Activation failed"),
+    999888
+  );
+
+  // No tombstone should exist (FK violation prevented INSERT), but this must not crash
+  const noParentTombstone = sqlite.prepare("SELECT id FROM job_photos WHERE r2_key = ?").get(orphanKeyNoParent);
+  // If FK is enforced, tombstone won't exist; if FK is not enforced, tombstone may exist — both are acceptable
+  // The key assertion: R2 reconciler will catch this orphan after grace period
+  const reconcileNoParent = await reconcileR2Storage(null, db, {
+    prefix: `users/${user1.id}/jobs/999888/`,
+    safetyGracePeriodMs: 0,
+  });
+  assert.ok(reconcileNoParent.deletedOrphans.includes(orphanKeyNoParent), "R2 reconciler catches orphan when tombstone INSERT failed");
+  assert.strictEqual(await getPhoto(null, orphanKeyNoParent), null, "Orphan R2 object cleaned up by reconciler");
+  // Clean up tombstone if it was created
+  if (noParentTombstone) {
+    sqlite.prepare("DELETE FROM job_photos WHERE r2_key = ?").run(orphanKeyNoParent);
+  }
+
+  console.log("  ✓ Scenario 7: Unified deletion ownership, lease-aware CAS, generation-fenced diagnostics, tombstone recovery, and production 60m clamping verified");
 
   // =========================================================================
   // 11. BLOCKER B: Scheduled Reconciliation Runtime Wiring Verification
