@@ -95,10 +95,10 @@ export async function POST(
       throw uploadErr;
     }
 
-    // Activate photo in D1
+    // Activate photo in D1 with generation fencing
     let activePhoto;
     try {
-      activePhoto = await activatePhotoSlot(env.DB, session.userId, reservedPhoto.id);
+      activePhoto = await activatePhotoSlot(env.DB, session.userId, reservedPhoto.id, r2Key);
     } catch (actErr) {
       await deletePhoto(r2Binding, r2Key);
       await failPhotoSlot(env.DB, session.userId, reservedPhoto.id);

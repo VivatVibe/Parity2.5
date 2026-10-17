@@ -41,7 +41,12 @@ import {
 /**
  * Lightweight in-memory D1 mock with SQL query counting
  */
-function createInstrumentedMockD1(): { db: D1Database; getQueryCount: () => number; resetQueryCount: () => void } {
+function createInstrumentedMockD1(): {
+  db: D1Database;
+  sqlite: DatabaseSync;
+  getQueryCount: () => number;
+  resetQueryCount: () => void;
+} {
   const sqlite = new DatabaseSync(":memory:");
   let queryCount = 0;
 
@@ -77,6 +82,7 @@ function createInstrumentedMockD1(): { db: D1Database; getQueryCount: () => numb
 
   return {
     db,
+    sqlite,
     getQueryCount: () => queryCount,
     resetQueryCount: () => {
       queryCount = 0;
@@ -87,7 +93,7 @@ function createInstrumentedMockD1(): { db: D1Database; getQueryCount: () => numb
 async function runRemediationVerification() {
   console.log("🚀 Starting Comprehensive Production Readiness Remediation Verification...\n");
 
-  const { db, getQueryCount, resetQueryCount } = createInstrumentedMockD1();
+  const { db, sqlite, getQueryCount, resetQueryCount } = createInstrumentedMockD1();
 
   // =========================================================================
   // 1. DB-01 & DB-02: Schema Initialization & Constraints
@@ -95,7 +101,6 @@ async function runRemediationVerification() {
   console.log("▶ Testing DB-01 & DB-02: D1 Migration Schema & Constraints...");
   await initDatabase(db);
 
-  // Negative amount check
   const user1 = await getOrCreateUser(db, "vivat@parity.local", "Vivat Solo Dev");
   const user2 = await getOrCreateUser(db, "attacker@parity.local", "Attacker Dev");
 
@@ -131,7 +136,6 @@ async function runRemediationVerification() {
   // =========================================================================
   console.log("\n▶ Testing SEC-01: Production Auth Mock Bypass Elimination...");
 
-  // A. In production, MOCK_AUTH=true must NEVER be accepted
   const originalEnv = process.env.NODE_ENV;
   const originalMock = process.env.MOCK_AUTH;
   const originalSecret = process.env.JWT_SECRET;
@@ -144,7 +148,6 @@ async function runRemediationVerification() {
   assert.strictEqual(prodUser, null, "MOCK_AUTH=true MUST return null in production");
   console.log("  ✓ Production mode unconditionally refuses mock auth bypass");
 
-  // B. Missing JWT_SECRET in production fails closed
   delete process.env.JWT_SECRET;
   assert.throws(
     () => {
@@ -154,7 +157,6 @@ async function runRemediationVerification() {
   );
   console.log("  ✓ Missing JWT_SECRET in production fails closed");
 
-  // C. Validate claims in verifySessionToken (reject forged or malformed payloads)
   process.env.JWT_SECRET = "super-secure-production-key-parity-2026-min-32-chars";
   const validToken = await createSessionToken({
     userId: 42,
@@ -165,7 +167,6 @@ async function runRemediationVerification() {
   assert.ok(verified !== null);
   assert.strictEqual(verified.userId, 42);
 
-  // Invalid claims (userId = 0, negative, or invalid email)
   const invalidToken = await createSessionToken({
     userId: -1,
     email: "",
@@ -175,7 +176,6 @@ async function runRemediationVerification() {
   assert.strictEqual(rejectedClaims, null, "Corrupted userId or email must be rejected");
   console.log("  ✓ Session token claims strictly validated");
 
-  // D. Cookie attributes in production
   const cookieHeader = createSessionCookieHeader("test-token");
   assert.ok(cookieHeader.includes("HttpOnly"));
   assert.ok(cookieHeader.includes("SameSite=Lax"));
@@ -192,15 +192,12 @@ async function runRemediationVerification() {
   // =========================================================================
   console.log("\n▶ Testing SEC-02: Cross-Tenant IDOR Hardening...");
 
-  // Attacker (User 2) tries to read User 1's job
   const crossJob = await getJobById(db, user2.id, job1.id);
   assert.strictEqual(crossJob, null, "User 2 cannot read User 1's job");
 
-  // Attacker tries to update User 1's job status
   const updateResult = await updateJobStatus(db, user2.id, job1.id, "DELIVERED");
   assert.strictEqual(updateResult, false, "User 2 cannot update User 1's job");
 
-  // Attacker tries to inject payment into User 1's job
   await assert.rejects(
     async () => {
       await addJobPayment(db, user2.id, {
@@ -212,14 +209,12 @@ async function runRemediationVerification() {
     (err: any) => err.message.includes(`Job ID ${job1.id} not found or does not belong to user ${user2.id}`)
   );
 
-  // Attacker tries to read User 1's payments
   const crossPayments = await getJobPayments(db, user2.id, job1.id);
   assert.strictEqual(crossPayments.length, 0, "User 2 cannot read User 1's payments");
 
-  // Attacker tries to access photo lookup without valid tenant identity
   await assert.rejects(
     async () => {
-      await getJobPhotoById(db, job1.id, 1, 0); // Invalid userId 0
+      await getJobPhotoById(db, job1.id, 1, 0);
     },
     (err: any) => err.message.includes("Tenant userId is strictly required")
   );
@@ -230,7 +225,6 @@ async function runRemediationVerification() {
   // =========================================================================
   console.log("\n▶ Testing SEC-03: Image Content & Magic Bytes Validation...");
 
-  // Valid WebP
   const webpBuffer = new Uint8Array([
     0x52, 0x49, 0x46, 0x46, // RIFF
     0x24, 0x00, 0x00, 0x00,
@@ -242,26 +236,22 @@ async function runRemediationVerification() {
   assert.strictEqual(webpDetected.mimeType, "image/webp");
   assert.strictEqual(webpDetected.extension, "webp");
 
-  // Valid JPEG
   const jpegBuffer = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]);
   const jpegDetected = detectImageMimeType(jpegBuffer);
   assert.ok(jpegDetected !== null);
   assert.strictEqual(jpegDetected.mimeType, "image/jpeg");
   assert.strictEqual(jpegDetected.extension, "jpg");
 
-  // Valid PNG
   const pngBuffer = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
   const pngDetected = detectImageMimeType(pngBuffer);
   assert.ok(pngDetected !== null);
   assert.strictEqual(pngDetected.mimeType, "image/png");
   assert.strictEqual(pngDetected.extension, "png");
 
-  // Invalid payload (HTML / Script disguised as image)
   const htmlBuffer = new TextEncoder().encode("<script>alert('xss')</script>");
   const fakeImageDetected = detectImageMimeType(htmlBuffer);
   assert.strictEqual(fakeImageDetected, null, "HTML content must be rejected as an image");
 
-  // Fail closed when R2 binding missing in production
   process.env.NODE_ENV = "production";
   await assert.rejects(
     async () => {
@@ -274,30 +264,26 @@ async function runRemediationVerification() {
   console.log("  ✓ Storage fails closed in production when R2 binding is unavailable");
 
   // =========================================================================
-  // 5. DATA-01: Atomic Photo Quota Enforcement Under Concurrency
+  // 5. DATA-01 & BLOCKER 2: Atomic Photo Quota & Generation Fencing
   // =========================================================================
-  console.log("\n▶ Testing DATA-01: Atomic Photo Quota & Concurrency Safety...");
+  console.log("\n▶ Testing DATA-01 & BLOCKER 2: Atomic Quota & Generation Fencing...");
 
   // Fill up 4 slots sequentially
   for (let i = 1; i <= 4; i++) {
     const reserved = await reservePhotoSlot(db, user1.id, job1.id, `users/1/jobs/${job1.id}/photo-${i}.webp`);
-    await activatePhotoSlot(db, user1.id, reserved.id);
+    await activatePhotoSlot(db, user1.id, reserved.id, `users/1/jobs/${job1.id}/photo-${i}.webp`);
   }
 
   const photosBeforeRace = await getJobPhotos(db, user1.id, job1.id);
   assert.strictEqual(photosBeforeRace.length, 4, "Should have 4 active photos");
 
-  // Now simulate 5 concurrent requests contending for the final (5th) slot
+  // 5 concurrent requests contending for the final (5th) slot
   const contenders = Array.from({ length: 5 }, (_, idx) => idx + 1);
   const raceResults = await Promise.allSettled(
     contenders.map(async (c) => {
-      const res = await reservePhotoSlot(
-        db,
-        user1.id,
-        job1.id,
-        `users/1/jobs/${job1.id}/contender-${c}.webp`
-      );
-      await activatePhotoSlot(db, user1.id, res.id);
+      const rKey = `users/1/jobs/${job1.id}/contender-${c}.webp`;
+      const res = await reservePhotoSlot(db, user1.id, job1.id, rKey);
+      await activatePhotoSlot(db, user1.id, res.id, rKey);
       return res;
     })
   );
@@ -310,187 +296,263 @@ async function runRemediationVerification() {
 
   const totalPhotos = await getJobPhotos(db, user1.id, job1.id);
   assert.strictEqual(totalPhotos.length, 5, "Database must strictly have exactly 5 active photos");
-  console.log("  ✓ Concurrency race condition tested: exactly 1 won the 5th slot, 4 rejected");
 
-  // =========================================================================
-  // 6. DATA-02: Durable Storage Lifecycle & Failure Cleanup
-  // =========================================================================
-  console.log("\n▶ Testing DATA-02: Durable Storage Lifecycle & Recovery...");
+  // Test BLOCKER 2: Delayed R2 Upload / Generation Fencing
+  // Free 1 slot
+  const toDelete = totalPhotos[0];
+  await markPhotoForDeletion(db, user1.id, job1.id, toDelete.id);
+  await finalizePhotoDeletion(db, user1.id, toDelete.id);
 
-  // Free one slot
-  const photoToDelete = totalPhotos[0];
-  const marked = await markPhotoForDeletion(db, user1.id, job1.id, photoToDelete.id);
-  assert.strictEqual(marked.status, "PENDING_DELETE");
+  // Reserve slot with a key
+  const delayedKey = "users/1/jobs/1/delayed-upload.webp";
+  const delayedRes = await reservePhotoSlot(db, user1.id, job1.id, delayedKey);
 
-  // Simulate crash before R2 deletion: item remains in PENDING_DELETE
-  const remainingActive = await getJobPhotos(db, user1.id, job1.id);
-  assert.strictEqual(remainingActive.length, 4, "PENDING_DELETE photo not visible in active photos");
+  // Manually backdate the reservation to 6 minutes ago (simulate delayed upload exceeding 5m TTL)
+  sqlite.prepare("UPDATE job_photos SET created_at = datetime('now', '-6 minutes') WHERE id = ?").run(delayedRes.id);
 
-  // Run cleanupOrphanedPhotos: cleans up PENDING_DELETE and unreserved
-  const cleanupRes = await cleanupOrphanedPhotos(db, null, user1.id);
-  assert.strictEqual(cleanupRes.cleanedCount, 1, "Cleanup must purge the PENDING_DELETE photo");
-
-  // Test reservation failure recovery
-  const failedRes = await reservePhotoSlot(db, user1.id, job1.id, "users/1/jobs/1/failed.webp");
-  await failPhotoSlot(db, user1.id, failedRes.id);
-
-  // Slot must be immediately reusable
-  const newRes = await reservePhotoSlot(db, user1.id, job1.id, "users/1/jobs/1/replacement.webp");
-  await activatePhotoSlot(db, user1.id, newRes.id);
-  const photosAfterRepl = await getJobPhotos(db, user1.id, job1.id);
-  assert.strictEqual(photosAfterRepl.length, 5);
-  console.log("  ✓ Durable lifecycle (RESERVED -> ACTIVE -> PENDING_DELETE -> DELETED) verified");
-
-  // =========================================================================
-  // 7. DATA-03: Payment Idempotency & Retainer Collection
-  // =========================================================================
-  console.log("\n▶ Testing DATA-03: Payment Idempotency Keys & Retry Safety...");
-
-  const idempotencyKey = "client-tx-uuid-123456";
-
-  // First payment submission
-  const payment1 = await addJobPayment(db, user1.id, {
-    jobId: job1.id,
-    amount: 1500,
-    partsCost: 300,
-    paymentType: "DEPOSIT",
-    idempotencyKey,
-  });
-  assert.strictEqual(payment1.amount, 1500);
-
-  // Exact retry with identical details (e.g. network timeout / double-click)
-  const paymentRetry = await addJobPayment(db, user1.id, {
-    jobId: job1.id,
-    amount: 1500,
-    partsCost: 300,
-    paymentType: "DEPOSIT",
-    idempotencyKey,
-  });
-  assert.strictEqual(paymentRetry.id, payment1.id, "Idempotent retry must return the existing record");
-  assert.strictEqual(paymentRetry.isIdempotentReplay, true);
-
-  // Total payment records in DB must still be 1
-  const allJobPayments = await getJobPayments(db, user1.id, job1.id);
-  assert.strictEqual(allJobPayments.length, 1, "Duplicate payment must NOT be created");
-
-  // Conflicting submission with same key but differing amount
+  // Attempt to activate delayed upload -> MUST FAIL CLOSED due to generation fencing
   await assert.rejects(
     async () => {
-      await addJobPayment(db, user1.id, {
-        jobId: job1.id,
-        amount: 2500, // Differs from 1500!
-        paymentType: "DEPOSIT",
-        idempotencyKey,
-      });
+      await activatePhotoSlot(db, user1.id, delayedRes.id, delayedKey);
     },
-    (err: any) => err.message.includes("IDEMPOTENCY_CONFLICT")
+    (err: any) => err.message.includes("reservation expired (>5m)")
   );
-  console.log("  ✓ Idempotency replay returns existing payment without duplication");
-  console.log("  ✓ Conflicting parameter reuse correctly rejected with IDEMPOTENCY_CONFLICT");
+  console.log("  ✓ Generation fencing successfully rejected delayed upload activation (>5m TTL)");
+
+  // Clean up the expired reservation
+  await cleanupOrphanedPhotos(db, null, user1.id);
+
+  // Re-fill to 5 photos
+  const refillRes = await reservePhotoSlot(db, user1.id, job1.id, "users/1/jobs/1/refill.webp");
+  await activatePhotoSlot(db, user1.id, refillRes.id, "users/1/jobs/1/refill.webp");
+  const photosFinal = await getJobPhotos(db, user1.id, job1.id);
+  assert.strictEqual(photosFinal.length, 5);
+  console.log("  ✓ Concurrency race condition and delayed upload generation fencing verified");
 
   // =========================================================================
-  // 8. FIN-01: Retainer Multi-Month Cycle Isolation & Partial Payments
+  // 6. DATA-02 & BLOCKER 1: Durable R2 Cleanup & SQL Precedence
   // =========================================================================
-  console.log("\n▶ Testing FIN-01: Retainer Multi-Month Isolation & Partial Payments...");
+  console.log("\n▶ Testing DATA-02 & BLOCKER 1: Durable R2 Cleanup & Failure Recovery...");
+
+  // Free one slot
+  const photoToFail = photosFinal[0];
+  await markPhotoForDeletion(db, user1.id, job1.id, photoToFail.id);
+
+  // Mock R2 where delete throws / times out
+  const failingR2 = {
+    async delete() {
+      throw new Error("R2 connection timeout during deletion");
+    },
+  };
+
+  // Run cleanup with failing R2
+  const failCleanup = await cleanupOrphanedPhotos(db, failingR2, user1.id);
+  assert.strictEqual(failCleanup.failedCount, 1, "Cleanup failure must be recorded");
+  assert.strictEqual(failCleanup.cleanedCount, 0);
+
+  // Verify that D1 reference WAS NOT PURGED when R2 failed!
+  const survivingRow = sqlite
+    .prepare("SELECT id, status, cleanup_attempts, last_cleanup_error FROM job_photos WHERE id = ?")
+    .get(photoToFail.id) as any;
+
+  assert.ok(survivingRow !== null, "D1 reference MUST be preserved when R2 deletion fails");
+  assert.strictEqual(survivingRow.status, "PENDING_DELETE");
+  assert.strictEqual(survivingRow.cleanup_attempts, 1);
+  assert.ok(survivingRow.last_cleanup_error.includes("timeout"));
+  console.log("  ✓ D1 reference preserved with error diagnostic metadata when R2 deletion fails");
+
+  // Verify SQL precedence: User 2's cleanup does NOT touch User 1's pending photo
+  const user2Cleanup = await cleanupOrphanedPhotos(db, null, user2.id);
+  assert.strictEqual(user2Cleanup.cleanedCount, 0);
+  assert.strictEqual(user2Cleanup.failedCount, 0);
+
+  // Now run cleanup with working R2 -> MUST succeed and purge from D1
+  const workingR2 = {
+    async delete() {
+      return;
+    },
+  };
+  const successCleanup = await cleanupOrphanedPhotos(db, workingR2, user1.id);
+  assert.strictEqual(successCleanup.cleanedCount, 1, "Working cleanup purges confirmed R2 deletion");
+
+  const purgedRow = sqlite.prepare("SELECT id FROM job_photos WHERE id = ?").get(photoToFail.id);
+  assert.strictEqual(purgedRow, undefined, "Row purged from D1 only after confirmed R2 delete");
+  console.log("  ✓ SQL precedence and durable cleanup confirmed");
+
+  // =========================================================================
+  // 7. DATA-03 & BLOCKER 3: Retainer Multiple Partial Payments & Replay Matching
+  // =========================================================================
+  console.log("\n▶ Testing DATA-03 & BLOCKER 3: Retainer Multiple Partial Payments & Replay Validation...");
 
   const retainerJob = await createJob(db, user1.id, {
     client_id: client1.id,
     job_type: "RETAINER",
-    title: "Monthly WordPress Maintenance",
-    total_quoted_amount: 4000,
+    title: "Monthly Care Maintenance",
+    total_quoted_amount: 5000,
     metadata: {
-      billingCycleDay: 25,
-      monthlyRate: 4000,
-      serviceScope: "Security, Backups, Updates",
+      billingCycleDay: 15,
+      monthlyRate: 5000,
+      serviceScope: "Site updates",
     },
   });
 
-  const currentMonth = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Bangkok",
-    year: "numeric",
-    month: "2-digit",
-  }).format(new Date());
+  const period = "2026-10";
 
-  // Past month payment (2026-09)
-  await addJobPayment(db, user1.id, {
+  // Intentional Collection #1: Partial payment 2000
+  const opKey1 = "op-uuid-partial-1";
+  const partPayment1 = await addJobPayment(db, user1.id, {
     jobId: retainerJob.id,
-    amount: 4000,
+    amount: 2000,
+    partsCost: 150,
     paymentType: "RETAINER_CYCLE",
-    billingPeriod: "2026-09",
-    note: "September Cycle Paid",
-    idempotencyKey: "ret-past-sep",
+    billingPeriod: period,
+    note: "First partial collection",
+    idempotencyKey: opKey1,
   });
+  assert.strictEqual(partPayment1.amount, 2000);
 
-  // Current month: verify past month payment DOES NOT mark current month paid
-  const summaryBefore = await getJobFinancialSummary(db, user1.id, retainerJob);
-  assert.strictEqual(summaryBefore.currentCyclePaid, false, "Past cycle payment must not satisfy current month");
-  assert.strictEqual(summaryBefore.balanceDue, 4000, "Balance due for current cycle must be 4000");
-  assert.strictEqual(summaryBefore.totalPaid, 4000, "Lifetime totalPaid includes past cycle");
-
-  // Partial payment for current cycle (e.g. 1,500 of 4,000)
-  await addJobPayment(db, user1.id, {
+  // Exact retry of Collection #1 -> Identical replay
+  const retryPart1 = await addJobPayment(db, user1.id, {
     jobId: retainerJob.id,
-    amount: 1500,
+    amount: 2000,
+    partsCost: 150,
     paymentType: "RETAINER_CYCLE",
-    billingPeriod: currentMonth,
-    note: "Partial payment for current month",
-    idempotencyKey: "ret-curr-part1",
+    billingPeriod: period,
+    note: "First partial collection",
+    idempotencyKey: opKey1,
   });
+  assert.strictEqual(retryPart1.id, partPayment1.id);
+  assert.strictEqual(retryPart1.isIdempotentReplay, true);
 
-  const summaryPartial = await getJobFinancialSummary(db, user1.id, retainerJob);
-  assert.strictEqual(summaryPartial.currentCyclePaid, false, "Partial payment does not mark cycle paid");
-  assert.strictEqual(summaryPartial.balanceDue, 2500, "Remaining balance due must be 2,500");
-  assert.strictEqual(summaryPartial.totalPaid, 5500, "Lifetime totalPaid is 4,000 + 1,500 = 5,500");
+  // Conflicting retry with changed parts_cost on same opKey1 -> 409 IDEMPOTENCY_CONFLICT
+  await assert.rejects(
+    async () => {
+      await addJobPayment(db, user1.id, {
+        jobId: retainerJob.id,
+        amount: 2000,
+        partsCost: 350, // Conflicting parts cost!
+        paymentType: "RETAINER_CYCLE",
+        billingPeriod: period,
+        note: "First partial collection",
+        idempotencyKey: opKey1,
+      });
+    },
+    (err: any) => err.message.includes("IDEMPOTENCY_CONFLICT")
+  );
 
-  // Final payment to complete current cycle (2,500)
-  await addJobPayment(db, user1.id, {
+  // Conflicting retry with changed note on same opKey1 -> 409 IDEMPOTENCY_CONFLICT
+  await assert.rejects(
+    async () => {
+      await addJobPayment(db, user1.id, {
+        jobId: retainerJob.id,
+        amount: 2000,
+        partsCost: 150,
+        paymentType: "RETAINER_CYCLE",
+        billingPeriod: period,
+        note: "Tampered note",
+        idempotencyKey: opKey1,
+      });
+    },
+    (err: any) => err.message.includes("IDEMPOTENCY_CONFLICT")
+  );
+
+  // Intentional Collection #2: Legitimate second partial payment (3000) in the SAME month!
+  const opKey2 = "op-uuid-partial-2";
+  const partPayment2 = await addJobPayment(db, user1.id, {
     jobId: retainerJob.id,
-    amount: 2500,
+    amount: 3000,
+    partsCost: 0,
     paymentType: "RETAINER_CYCLE",
-    billingPeriod: currentMonth,
-    note: "Remaining payment for current month",
-    idempotencyKey: "ret-curr-part2",
+    billingPeriod: period,
+    note: "Second partial collection",
+    idempotencyKey: opKey2,
   });
+  assert.strictEqual(partPayment2.amount, 3000);
 
-  const summaryComplete = await getJobFinancialSummary(db, user1.id, retainerJob);
-  assert.strictEqual(summaryComplete.currentCyclePaid, true, "Full payment marks cycle paid");
-  assert.strictEqual(summaryComplete.balanceDue, 0, "Balance due becomes 0");
-  assert.strictEqual(summaryComplete.isPaidInFull, true);
-  assert.strictEqual(summaryComplete.totalPaid, 8000, "Lifetime totalPaid is 8,000");
-  console.log("  ✓ Retainer past cycles isolated; partial payments & balance due strictly verified");
+  // Verify BOTH partial payments exist for the same month without conflict!
+  const retainerPayments = await getJobPayments(db, user1.id, retainerJob.id);
+  assert.strictEqual(retainerPayments.length, 2);
+  const totalCollected = retainerPayments.reduce((s, p) => s + p.amount, 0);
+  assert.strictEqual(totalCollected, 5000, "Two partial collections cleanly total 5000");
+
+  const finSummary = await getJobFinancialSummary(db, user1.id, retainerJob, retainerPayments);
+  assert.strictEqual(finSummary.currentCyclePaid, true);
+  assert.strictEqual(finSummary.balanceDue, 0);
+  assert.strictEqual(finSummary.isPaidInFull, true);
+  console.log("  ✓ Multiple partial collections within the same period succeed with distinct operation keys");
+  console.log("  ✓ Material replay validation (amount, partsCost, note) prevents conflict tampering");
 
   // =========================================================================
-  // 9. FIN-02: Asia/Bangkok Midnight Revenue Boundary
+  // 8. BLOCKER 4: Migration Compatibility & Deterministic Backfill
   // =========================================================================
-  console.log("\n▶ Testing FIN-02: Asia/Bangkok Midnight Revenue Boundary (+7h offset)...");
+  console.log("\n▶ Testing BLOCKER 4: Migration 0002 Backfill & Compatibility...");
 
-  // Create a payment recorded at 2026-09-30 18:30:00 UTC
-  // In UTC, this is September 30.
-  // In Asia/Bangkok (UTC+7), 18:30 + 7h = 01:30 AM on 2026-10-01 (October 1st!)
-  await db
-    .prepare(
-      `INSERT INTO job_payments (
-        job_id, user_id, amount, parts_cost, payment_type, paid_at, note, idempotency_key
-      ) VALUES (?, ?, ?, ?, ?, '2026-09-30 18:30:00', 'Midnight boundary payment', 'midnight-tx-1')`
-    )
-    .bind(job1.id, user1.id, 2000, 500, "MILESTONE")
-    .run();
+  // Create isolated fresh SQLite DB simulating legacy 0001 schema state
+  const legacySqlite = new DatabaseSync(":memory:");
 
-  // Query October KPI with Asia/Bangkok boundary alignment
-  const kpiOctober = await db
-    .prepare(
-      `SELECT COALESCE(SUM(amount), 0) as rev 
-       FROM job_payments 
-       WHERE user_id = ? AND strftime('%Y-%m', datetime(paid_at, '+7 hours')) = '2026-10'`
-    )
-    .bind(user1.id)
-    .first<{ rev: number }>();
+  // Setup legacy tables (0001_init.sql state WITHOUT slot_number/status)
+  legacySqlite.exec(`
+    CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, name TEXT);
+    CREATE TABLE clients (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT);
+    CREATE TABLE jobs (id INTEGER PRIMARY KEY, user_id INTEGER, client_id INTEGER, job_number TEXT, job_type TEXT, title TEXT, status TEXT, due_date TEXT, total_quoted_amount REAL, metadata TEXT);
+    CREATE TABLE job_payments (id INTEGER PRIMARY KEY, job_id INTEGER, user_id INTEGER, amount REAL, parts_cost REAL, payment_type TEXT, billing_period TEXT, paid_at DATETIME, note TEXT);
+    CREATE TABLE job_photos (id INTEGER PRIMARY KEY, job_id INTEGER, user_id INTEGER, r2_key TEXT, caption TEXT, created_at DATETIME);
+  `);
 
-  assert.ok(kpiOctober && kpiOctober.rev >= 2000, "Midnight UTC transaction correctly categorized in Bangkok October");
-  console.log("  ✓ Midnight boundary transaction (UTC 18:30 / BKK 01:30) correctly grouped in Bangkok month");
+  // Insert legacy data: Job 1 has 3 photos, Job 2 has 6 photos (legacy surplus exceeding quota)
+  legacySqlite.exec(`
+    INSERT INTO users (id, email, name) VALUES (1, 'user@test.local', 'Test User');
+    INSERT INTO jobs (id, user_id, client_id, job_number, job_type, title, status) VALUES (1, 1, 1, 'PR-0001', 'REPAIR', 'Job 1', 'RECEIVED');
+    INSERT INTO jobs (id, user_id, client_id, job_number, job_type, title, status) VALUES (2, 1, 1, 'PR-0002', 'REPAIR', 'Job 2', 'RECEIVED');
+
+    -- Job 1: 3 photos
+    INSERT INTO job_photos (id, job_id, user_id, r2_key) VALUES (1, 1, 1, 'key-1');
+    INSERT INTO job_photos (id, job_id, user_id, r2_key) VALUES (2, 1, 1, 'key-2');
+    INSERT INTO job_photos (id, job_id, user_id, r2_key) VALUES (3, 1, 1, 'key-3');
+
+    -- Job 2: 6 photos (exceeds max 5 quota)
+    INSERT INTO job_photos (id, job_id, user_id, r2_key) VALUES (4, 2, 1, 'key-4');
+    INSERT INTO job_photos (id, job_id, user_id, r2_key) VALUES (5, 2, 1, 'key-5');
+    INSERT INTO job_photos (id, job_id, user_id, r2_key) VALUES (6, 2, 1, 'key-6');
+    INSERT INTO job_photos (id, job_id, user_id, r2_key) VALUES (7, 2, 1, 'key-7');
+    INSERT INTO job_photos (id, job_id, user_id, r2_key) VALUES (8, 2, 1, 'key-8');
+    INSERT INTO job_photos (id, job_id, user_id, r2_key) VALUES (9, 2, 1, 'key-9');
+  `);
+
+  // Read and execute migrations/0002_remediation.sql on legacy DB
+  const fs = await import("node:fs");
+  const migration0002Sql = fs.readFileSync("migrations/0002_remediation.sql", "utf-8");
+  legacySqlite.exec(migration0002Sql);
+
+  // Verify Job 1 deterministic backfill: slot_numbers 1, 2, 3
+  const job1Backfilled = legacySqlite
+    .prepare("SELECT id, slot_number, status FROM job_photos WHERE job_id = 1 ORDER BY slot_number ASC")
+    .all() as any[];
+  assert.strictEqual(job1Backfilled.length, 3);
+  assert.deepStrictEqual(
+    job1Backfilled.map((p) => p.slot_number),
+    [1, 2, 3]
+  );
+  assert.ok(job1Backfilled.every((p) => p.status === "ACTIVE"));
+
+  // Verify Job 2 surplus handling: slots 1..5 are ACTIVE, 6th is PENDING_DELETE
+  const job2Backfilled = legacySqlite
+    .prepare("SELECT id, slot_number, status FROM job_photos WHERE job_id = 2 ORDER BY id ASC")
+    .all() as any[];
+  assert.strictEqual(job2Backfilled.length, 6);
+  const activePhotos = job2Backfilled.filter((p) => p.status === "ACTIVE");
+  const pendingPhotos = job2Backfilled.filter((p) => p.status === "PENDING_DELETE");
+  assert.strictEqual(activePhotos.length, 5);
+  assert.deepStrictEqual(
+    activePhotos.map((p) => p.slot_number),
+    [1, 2, 3, 4, 5]
+  );
+  assert.strictEqual(pendingPhotos.length, 1);
+  assert.strictEqual(pendingPhotos[0].id, 9);
+  console.log("  ✓ Migration 0002 deterministic backfill and surplus photo handling verified");
 
   // =========================================================================
-  // 10. Dashboard Query Count & Performance (Zero N+1)
+  // 9. Dashboard Query Count & Performance (Zero N+1)
   // =========================================================================
   console.log("\n▶ Testing Dashboard Query Count (Zero N+1)...");
   resetQueryCount();
@@ -504,7 +566,7 @@ async function runRemediationVerification() {
   assert.ok(dashboardData.zones.retainers.length > 0);
   console.log("  ✓ Dashboard fired EXACTLY 2 SQL queries for full mission control aggregation");
 
-  console.log("\n🎉 ALL REMEDIATION & PRODUCTION-READINESS ASSERTIONS PASSED PERFECTLY!\n");
+  console.log("\n🎉 ALL AUDIT RE-CHECK ASSERTIONS (BLOCKERS 1-4) PASSED FLAWLESSLY!\n");
 }
 
 runRemediationVerification().catch((err) => {

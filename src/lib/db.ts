@@ -56,6 +56,8 @@ export interface JobPhotoRecord {
   r2_key: string;
   caption?: string;
   status: "RESERVED" | "ACTIVE" | "PENDING_DELETE" | "FAILED";
+  cleanup_attempts?: number;
+  last_cleanup_error?: string;
   created_at: string;
 }
 
@@ -128,6 +130,8 @@ export async function initDatabase(db: D1Database): Promise<void> {
       r2_key TEXT NOT NULL,
       caption TEXT,
       status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('RESERVED', 'ACTIVE', 'PENDING_DELETE', 'FAILED')),
+      cleanup_attempts INTEGER DEFAULT 0,
+      last_cleanup_error TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(job_id, slot_number)
     );
@@ -508,8 +512,10 @@ export async function addJobPayment(
       const isMatch =
         existing.job_id === payment.jobId &&
         Number(existing.amount) === Number(payment.amount) &&
+        Number(existing.parts_cost || 0) === Number(payment.partsCost || 0) &&
         existing.payment_type === payment.paymentType &&
-        (existing.billing_period || null) === (payment.billingPeriod || null);
+        (existing.billing_period || null) === (payment.billingPeriod || null) &&
+        (existing.note || null) === (payment.note || null);
 
       if (isMatch) {
         return { ...existing, isIdempotentReplay: true };
@@ -552,8 +558,10 @@ export async function addJobPayment(
         const isMatch =
           existing.job_id === payment.jobId &&
           Number(existing.amount) === Number(payment.amount) &&
+          Number(existing.parts_cost || 0) === Number(payment.partsCost || 0) &&
           existing.payment_type === payment.paymentType &&
-          (existing.billing_period || null) === (payment.billingPeriod || null);
+          (existing.billing_period || null) === (payment.billingPeriod || null) &&
+          (existing.note || null) === (payment.note || null);
 
         if (isMatch) {
           return { ...existing, isIdempotentReplay: true };
@@ -672,17 +680,8 @@ export async function reservePhotoSlot(
     .all<{ id: number; slot_number: number; status: string; created_at: string }>();
 
   const occupiedSlots = new Set<number>();
-  const now = Date.now();
-
   for (const row of existingRows.results || []) {
-    // If RESERVED and older than 5 minutes, consider it expired and clean it up
-    const createdAtMs = new Date(row.created_at + (row.created_at.endsWith("Z") ? "" : "Z")).getTime();
-    const isExpired = row.status === "RESERVED" && now - createdAtMs > 5 * 60 * 1000;
-    if (isExpired) {
-      await db.prepare("DELETE FROM job_photos WHERE id = ?").bind(row.id).run();
-    } else {
-      occupiedSlots.add(row.slot_number);
-    }
+    occupiedSlots.add(row.slot_number);
   }
 
   if (occupiedSlots.size >= 5) {
@@ -719,7 +718,7 @@ export async function reservePhotoSlot(
       const retrySlots = await db
         .prepare(
           `SELECT slot_number FROM job_photos 
-           WHERE job_id = ? AND user_id = ? AND status IN ('ACTIVE', 'RESERVED')`
+           WHERE job_id = ? AND user_id = ? AND status IN ('ACTIVE', 'RESERVED', 'PENDING_DELETE')`
         )
         .bind(jobId, userId)
         .all<{ slot_number: number }>();
@@ -748,18 +747,36 @@ export async function reservePhotoSlot(
 export async function activatePhotoSlot(
   db: D1Database,
   userId: number,
-  photoId: number
+  photoId: number,
+  r2Key?: string
 ): Promise<JobPhotoRecord> {
-  const res = await db
-    .prepare(
-      `UPDATE job_photos SET status = 'ACTIVE' 
-       WHERE id = ? AND user_id = ? AND status = 'RESERVED' 
-       RETURNING *`
-    )
-    .bind(photoId, userId)
-    .first<JobPhotoRecord>();
+  let query = `
+    UPDATE job_photos 
+    SET status = 'ACTIVE' 
+    WHERE id = ? AND user_id = ? AND status = 'RESERVED' 
+      AND created_at >= datetime('now', '-5 minutes')
+  `;
+  const params: any[] = [photoId, userId];
 
-  if (!res) throw new Error("Failed to activate photo record or photo not in RESERVED state");
+  if (r2Key) {
+    query = `
+      UPDATE job_photos 
+      SET status = 'ACTIVE' 
+      WHERE id = ? AND user_id = ? AND r2_key = ? AND status = 'RESERVED' 
+        AND created_at >= datetime('now', '-5 minutes')
+    `;
+    params.push(r2Key);
+  }
+
+  query += " RETURNING *";
+
+  const res = await db.prepare(query).bind(...params).first<JobPhotoRecord>();
+
+  if (!res) {
+    throw new Error(
+      "Failed to activate photo record: reservation expired (>5m), already cleaned up, or invalid key"
+    );
+  }
   return res;
 }
 
@@ -832,11 +849,15 @@ export async function cleanupOrphanedPhotos(
   db: D1Database,
   r2: any,
   userId?: number
-): Promise<{ cleanedCount: number }> {
+): Promise<{ cleanedCount: number; failedCount: number }> {
+  // Correct SQL precedence: wrap OR condition in parentheses
   let query = `
-    SELECT id, user_id, r2_key, status, created_at FROM job_photos 
-    WHERE status = 'PENDING_DELETE' 
-       OR (status = 'RESERVED' AND created_at < datetime('now', '-5 minutes'))
+    SELECT id, user_id, r2_key, status, created_at, cleanup_attempts 
+    FROM job_photos 
+    WHERE (
+      status = 'PENDING_DELETE' 
+      OR (status = 'RESERVED' AND created_at < datetime('now', '-5 minutes'))
+    )
   `;
   const params: any[] = [];
   if (userId !== undefined) {
@@ -850,20 +871,51 @@ export async function cleanupOrphanedPhotos(
     r2_key: string;
     status: string;
     created_at: string;
+    cleanup_attempts: number;
   }>();
 
   let cleanedCount = 0;
+  let failedCount = 0;
+
   for (const row of results || []) {
+    // Atomically transition RESERVED to PENDING_DELETE so in-flight delayed activation is fenced out
+    if (row.status === "RESERVED") {
+      await db
+        .prepare("UPDATE job_photos SET status = 'PENDING_DELETE' WHERE id = ? AND status = 'RESERVED'")
+        .bind(row.id)
+        .run();
+    }
+
+    let r2Success = false;
+    let r2Error = "";
     try {
       await deletePhoto(r2, row.r2_key);
-    } catch (e) {
-      // Continue cleanup even if R2 delete fails
+      r2Success = true;
+    } catch (err: any) {
+      r2Success = false;
+      r2Error = err?.message || "R2 deletion failed";
     }
-    await db.prepare("DELETE FROM job_photos WHERE id = ?").bind(row.id).run();
-    cleanedCount++;
+
+    if (r2Success) {
+      // ONLY delete from D1 if R2 deletion succeeded
+      await db.prepare("DELETE FROM job_photos WHERE id = ?").bind(row.id).run();
+      cleanedCount++;
+    } else {
+      // Retain D1 reference, increment attempts and store error for retry
+      failedCount++;
+      await db
+        .prepare(
+          `UPDATE job_photos 
+           SET cleanup_attempts = COALESCE(cleanup_attempts, 0) + 1, 
+               last_cleanup_error = ? 
+           WHERE id = ?`
+        )
+        .bind(r2Error, row.id)
+        .run();
+    }
   }
 
-  return { cleanedCount };
+  return { cleanedCount, failedCount };
 }
 
 // 8. Mission Control Dashboard Aggregation (Zero N+1 Queries)

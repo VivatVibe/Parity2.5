@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS job_photos (
   r2_key TEXT NOT NULL,
   caption TEXT,
   status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('RESERVED', 'ACTIVE', 'PENDING_DELETE', 'FAILED')),
+  cleanup_attempts INTEGER DEFAULT 0,
+  last_cleanup_error TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(job_id, slot_number)
 );

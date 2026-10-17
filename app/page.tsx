@@ -67,7 +67,8 @@ export default function MissionControlDashboard() {
 
     try {
       setCollectingRetainerId(job.id);
-      const idempotencyKey = `retainer-${job.id}-${period}`;
+      const opId = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+      const idempotencyKey = `ret-collect-${job.id}-${period}-${opId}`;
       const res = await fetch(`/api/jobs/${job.id}/payments`, {
         method: "POST",
         headers: {

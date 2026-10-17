@@ -1,72 +1,99 @@
-# ADR 0002: Storage Lifecycle & Financial Accounting Model
+# ADR 0002: Storage Lifecycle, Reservation Fencing & Financial Accounting Model
 
 ## Status
-Accepted
+Accepted (Amended for Re-Audit Remediation)
 
 ## Context
-During the independent architecture audit of Parity 2.5, two critical areas required explicit architectural documentation and durable state management:
-1. **Durable R2/D1 Storage Consistency & Atomic Quota (DATA-01, DATA-02):** Uncoordinated D1 SELECT COUNT and R2 PUT operations permitted concurrent quota evasion and orphaned R2 storage objects upon failures.
-2. **Retainer Billing Cycle & Financial Reporting Model (FIN-01, FIN-02):** Ambiguity in multi-month retainer lifecycle, partial payments, and timezone boundary definitions.
+During the independent re-audit of PR #2, four specific edge and consistency blockers were identified:
+1. **Durable R2 Cleanup:** `cleanupOrphanedPhotos()` must never purge D1 records when R2 deletion fails or is uncertain, and must correct SQL precedence on tenant filtering.
+2. **Reservation Fencing & Expiry:** Inline deletion of expired reservations inside `reservePhotoSlot()` caused race conditions with delayed uploads. A generation fencing and two-phase cleanup transition is required.
+3. **Operation-Scoped Idempotency:** Static monthly keys blocked legitimate partial payments within the same billing period.
+4. **Deterministic Migration Backfill:** Databases upgrading from `0001_init.sql` with preexisting photos require deterministic `slot_number` assignment before index enforcement.
 
 ---
 
-## 1. Storage Lifecycle & State Transitions
+## 1. Storage Lifecycle, Fencing & State Transitions
 
 ### Schema Design
-The `job_photos` table is enhanced with two new fields:
-- `slot_number INTEGER NOT NULL CHECK(slot_number BETWEEN 1 AND 5)`: Guarantees at the database level that no job can ever exceed 5 photos.
-- `status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('RESERVED', 'ACTIVE', 'PENDING_DELETE', 'FAILED'))`: Tracks lifecycle state.
-- `UNIQUE(job_id, slot_number)`: Enforces concurrency safety in SQLite/D1.
+`job_photos` is enhanced with:
+- `slot_number INTEGER NOT NULL CHECK(slot_number BETWEEN 1 AND 5)`: Hard ceiling of 5 photos per job.
+- `status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('RESERVED', 'ACTIVE', 'PENDING_DELETE', 'FAILED'))`.
+- `cleanup_attempts INTEGER DEFAULT 0`: Tracks retry counts for failed R2 deletions.
+- `last_cleanup_error TEXT`: Preserves error diagnostic info when R2 operations fail.
+- `UNIQUE(job_id, slot_number)`: Serializes concurrent slot contenders at the SQLite/D1 engine level.
 
-### State Transition Diagram
+### State Transitions & Generation Fencing
 ```
 [Client Upload Request]
        │
        ▼
-  [RESERVED] ──(R2 Upload Failure)──► [FAILED / DELETED] (Slot immediately released)
+  [RESERVED] (TTL: 5 minutes, bound to photoId + r2Key)
        │
-       ▼ (R2 Upload Success)
-   [ACTIVE] ──(User Deletion)──► [PENDING_DELETE]
-       │                                │
-       │                                ▼ (R2 Object Deleted)
-       │                            [DELETED] (Row removed from D1)
-       │                                │
-       │                                ▼ (If R2 Delete Fails)
-       └──────(Orphan Sweep / Retry)──► [Re-attempt R2 Delete & Purge]
+       ├─► (R2 Upload Fails) ──────────────────► [Purge D1 Reservation]
+       │
+       ├─► (R2 Upload Delayed > 5 mins) ────────► [Fencing Rejection on Activation]
+       │                                                 │
+       │                                                 ▼
+       │                                         [Delete Delayed R2 Object]
+       │
+       ▼ (R2 Upload Succeeded within TTL)
+   [ACTIVE]
+       │
+       ▼ (User Deletion or Orphan Sweep)
+ [PENDING_DELETE] ──(R2 Delete Fails)──────────► [Retain in PENDING_DELETE with Error]
+       │                                                 ▲ (Next Sweep Retries)
+       │                                                 │
+       ▼ (R2 Delete Confirmed Success)                   │
+   [DELETED] (Row purged from D1) ───────────────────────┘
 ```
 
-### Detailed Failure Recovery Rules:
-1. **Atomic Slot Reservation:** Before streaming bytes to R2, the system atomically reserves an available `slot_number` (1..5) in D1 with `status = 'RESERVED'` and a timestamp. If all 5 slots are occupied, D1 immediately rejects the request. Concurrent requests contending for the same slot are serialized by `UNIQUE(job_id, slot_number)`.
-2. **Upload Failure:** If the R2 write fails or times out, the `RESERVED` row is immediately removed from D1 (or marked `FAILED`), releasing the quota slot.
-3. **Commit Failure:** If R2 write succeeds but D1 activation fails, the reservation remains `RESERVED`. Any reservation older than 5 minutes is considered abandoned and eligible for automatic garbage collection (`cleanupOrphanedPhotos`), which deletes the R2 object and purges the row.
-4. **Deletion Crash Protection:** When deleting a photo, the system first marks the row as `PENDING_DELETE` in D1. It then deletes the object in Cloudflare R2. Only upon successful R2 deletion is the D1 record completely purged. If the R2 delete fails or the worker crashes mid-flight, the record remains in `PENDING_DELETE` with its `r2_key` intact, allowing retryable background cleanup without losing references.
+### Critical Concurrency & Fencing Rules:
+1. **No Inline Deletions by Contenders:** `reservePhotoSlot()` NEVER deletes rows created by other requests. Expired reservations are transitioned via dedicated cleanup routines or fenced out.
+2. **Generation Fencing:** When `activatePhotoSlot()` is invoked:
+   ```sql
+   UPDATE job_photos 
+   SET status = 'ACTIVE'
+   WHERE id = ? AND user_id = ? AND r2_key = ? 
+     AND status = 'RESERVED' 
+     AND created_at >= datetime('now', '-5 minutes')
+   RETURNING *;
+   ```
+   If a delayed upload arrives after its 5-minute reservation window, the activation update returns 0 rows. The worker catches this failure and immediately calls `deletePhoto(r2, r2Key)` to remove the delayed R2 binary.
+   *(Note: While D1 cannot physically cancel an in-flight R2 network packet, fencing guarantees that a delayed packet can neither activate in D1 nor overwrite another slot, and the abort cleanup removes it).*
+3. **Durable Cleanup Guarantee:** `cleanupOrphanedPhotos()` attempts `deletePhoto(r2, r2Key)`. Only if R2 deletion succeeds is the D1 record deleted. If R2 deletion throws or times out, the D1 record is **retained** with incremented `cleanup_attempts` and `last_cleanup_error` for subsequent retry.
+4. **SQL Precedence:** Tenant filtering in cleanup is strictly parenthesized:
+   ```sql
+   WHERE (status = 'PENDING_DELETE' OR (status = 'RESERVED' AND created_at < datetime('now', '-5 minutes')))
+     AND user_id = ?
+   ```
 
 ---
 
-## 2. Retainer Billing Period & Financial Accounting Model
+## 2. Operation-Scoped Idempotency & Partial Payments
 
-### Domain Definitions
-In Parity 2.5, **Retainer Jobs (`RETAINER`)** represent ongoing monthly service contracts (e.g., WordPress maintenance, SEO management) characterized by:
-- `total_quoted_amount` / `metadata.monthlyRate`: The recurring monthly fee (e.g., ฿5,000/month).
-- `metadata.billingCycleDay`: The day of each month (1–31) on which payment is due or invoiced.
-- `billing_period`: A standard ISO year-month string (`YYYY-MM`, e.g., `"2026-10"`), representing the monthly service billing cycle.
+### Domain Rules
+- **No Static Keys:** Idempotency keys must represent a single **intentional user operation**, not a whole calendar month.
+- **Dynamic Key Generation:** Every user click or form submission generates a unique client operation UUID (`crypto.randomUUID()`). Network retries of that specific operation reuse the key.
+- **Multiple Partial Payments:** Because each partial collection has its own operation key, a client can make multiple partial payments within the same month (e.g., ฿2,000 on Oct 5 and ฿2,000 on Oct 20) without key collisions.
+- **Replay Validation:** On duplicate key submission, the server validates all material fields (`job_id`, `amount`, `parts_cost`, `payment_type`, `billing_period`, `note`). Matching fields return the recorded payment (`isIdempotentReplay: true`); conflicting fields return HTTP 409 (`IDEMPOTENCY_CONFLICT`).
 
-### Strict Cycle Isolation Rules
-1. **Cycle Separation:** Payments recorded in `job_payments` with `payment_type = 'RETAINER_CYCLE'` must specify their target `billing_period` (`YYYY-MM`). Payments for past cycles (e.g. `"2026-09"`) do not satisfy current or future cycles (`"2026-10"`).
-2. **Current Cycle Paid Calculation:**
-   $$\text{currentCyclePaidAmount} = \sum_{\substack{p \in \text{payments} \\ p.\text{payment\_type} = \text{'RETAINER\_CYCLE'} \\ p.\text{billing\_period} = \text{currentBangkokMonth}}} p.\text{amount}$$
-   $$\text{currentCyclePaid} = (\text{currentCyclePaidAmount} \ge \text{monthlyRate}) \land (\text{monthlyRate} > 0)$$
-   $$\text{balanceDue} = \max(0, \text{monthlyRate} - \text{currentCyclePaidAmount})$$
-3. **Partial Payments:** If a client pays partially (e.g., ฿2,000 of a ฿5,000 monthly rate), `balanceDue` reflects the remaining ฿3,000, and `currentCyclePaid` remains `false`.
-4. **Lifetime Revenue vs. Cycle Status:** `totalPaid` on a Retainer reflects cumulative lifetime collections across all months, while `isPaidInFull` and `balanceDue` reflect the status of the current active billing cycle.
+---
 
-### Timezone Boundaries & Accounting Definition
-- **Timezone:** All financial month boundaries are strictly computed using **Asia/Bangkok (UTC+7)** (`new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Bangkok" })`).
-- **Database Query Alignment:** In SQLite, UTC timestamps in `paid_at` are converted to Asia/Bangkok time using `datetime(paid_at, '+7 hours')` before month extraction:
-  ```sql
-  strftime('%Y-%m', datetime(paid_at, '+7 hours')) = ?
-  ```
-  This prevents midnight transactions (e.g., 01:00 AM on the 1st of the month in Bangkok) from being misattributed to the previous calendar month.
-- **Gross Profit (Contribution Margin) Definition:**
-  $$\text{Contribution Margin} = \text{Revenue} - \text{Direct Hardware Parts Cost}$$
-  The dashboard and API clearly define this metric as **Contribution Margin / Gross Profit before overhead**, avoiding misleading claims of full GAAP Net Profit.
+## 3. Migration Compatibility & Deterministic Backfill
+
+### Upgrade Path (`migrations/0002_remediation.sql`)
+For preexisting databases created under `0001_init.sql`:
+1. Add columns `slot_number`, `status`, `cleanup_attempts`, `last_cleanup_error`, and `idempotency_key`.
+2. Deterministically backfill `slot_number` for existing photos using SQLite window functions:
+   ```sql
+   UPDATE job_photos
+   SET slot_number = (
+     SELECT rnum FROM (
+       SELECT id, ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY id ASC) as rnum
+       FROM job_photos
+     ) t WHERE t.id = job_photos.id
+   )
+   WHERE slot_number IS NULL;
+   ```
+3. For any historical surplus photos beyond quota ($rnum > 5$), set `status = 'PENDING_DELETE'`.
+4. Apply the unique index `idx_photos_job_slot ON job_photos(job_id, slot_number)`.
