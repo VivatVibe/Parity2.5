@@ -5,7 +5,7 @@
 
 ## 1. Core Problem & User
 - **ปัญหาหลัก:** ผู้ประกอบการคนเดียว (Solo Worker / Freelancer) ที่ให้บริการหลายรูปแบบ ทั้ง **งานซ่อมคอม/ฮาร์ดแวร์**, **งานออนไลน์รายโปรเจกต์ (SEO/Web)**, และ **งานบริการรายเดือน (Monthly Retainer/Web Care)** ต้องการระบบเดียวที่จัดการลูกค้า ติดตามสถานะงาน ไม่ให้งานตกหล่น และตามเก็บเงินได้ครบถ้วน
-- **ผู้ใช้งาน:** เจ้าของคนเดียว (Single Owner) จัดการงานทั้งหมดจากมือถือหรือคอมพิวเตอร์
+- **ผู้ใช้งาน:** เจ้าของระบบล็อกอินผ่าน Google Account รองรับการขยายเป็น Multi-tenant ในอนาคตเพื่อนำไปจำหน่ายให้ผู้อื่นได้
 - **ประเภทงานที่รองรับ:**
   1. `REPAIR`: งานซ่อมคอมพิวเตอร์ / โน้ตบุ๊ก / อุปกรณ์ IT (รับเครื่อง, อะไหล่, รูปถ่ายสภาพ)
   2. `PROJECT`: งานออนไลน์เป็นจ็อบ เช่น ทำ SEO Audit, ปรับแต่ง On-page, ขึ้นเว็บไซต์ใหม่
@@ -15,30 +15,30 @@
 
 ## 2. ขอบเขตฟังก์ชันหลัก (Core Workflows)
 
-### 2.1 รับงาน / เปิดจ็อบ (Job Intake)
-- **เลือกลูกค้า:** ค้นหาลูกค้าเดิม (จากเบอร์/ชื่อ) หรือกรอกลูกค้าใหม่
+### 2.1 การเข้าสู่ระบบและความปลอดภัย (Authentication)
+- ล็อกอินด้วย **Google OAuth 2.0**
+- ข้อมูลทั้งหมดถูกแยกตาม `user_id` อย่างเด็ดขาด (Data Isolation) ทำให้พร้อมสำหรับ Multi-tenant / Commercialization โดยไม่ต้องแก้ Schema ในภายหลัง
+- Session จัดการผ่าน Secure HTTP-only Cookie
+
+### 2.2 หน้าแรกของระบบ (Unified Mission Control Dashboard)
+- แบ่งเป็น 3 โซนเห็นภาพรวมทันที:
+  1. 🔧 **Active Repairs:** งานซ่อมที่กำลังตรวจเช็ค/รออะไหล่/รอส่งมอบ
+  2. 💻 **Active Projects:** งานโปรเจกต์ SEO ที่กำลังทำ เรียงตาม Deadline
+  3. 📅 **Due Retainers:** งานบริการรายเดือนที่ถึงรอบบิลของเดือนนี้ พร้อมแจ้งเตือนตามเก็บเงิน
+- **ปุ่มเปิดงานด่วน:** `[+ เปิดใบงานใหม่]` ด้านล่าง กดเลือกประเภทงานแล้วบันทึกเสร็จใน 10 วินาที
+- **ค้นหาด่วน (Quick Search):** ค้นจากชื่อลูกค้า, เบอร์โทร, รหัสงาน, หรือ URL เว็บไซต์
+
+### 2.3 รับงาน / เปิดจ็อบ (Job Intake)
+- เลือกลูกค้าเดิม หรือสร้างลูกค้าใหม่
 - **เลือกประเภทงาน (`JobType`):**
-  - หากเป็น **`REPAIR`**: ระบุประเภทอุปกรณ์, ยี่ห้อ/รุ่น, อาการเสีย, อุปกรณ์ที่ติดมาด้วย, ถ่ายรูปสภาพเครื่อง (จัดเก็บใน Cloudflare R2)
-  - หากเป็น **`PROJECT`**: ระบุชื่องาน, รายละเอียด Scope, กำหนดส่ง (Deadline), ลิงก์แนบงาน (Google Drive, Figma, Docs)
-  - หากเป็น **`RETAINER`**: ระบุขอบเขตงานรายเดือน, วันที่ตัดรอบบิล (เช่น ทุกวันที่ 1 ของเดือน), อัตราค่าบริการรายเดือน
-- **การเงินเริ่มต้น:** ระบุมูลค่างาน, เงินมัดจำ (ถ้ามี)
-- **รหัสใบงาน:** ออกรหัสออโต้ตามประเภทงาน เช่น `PR-2026-0001` (Repair), `PJ-2026-0001` (Project), `RT-2026-0001` (Retainer)
+  - หากเป็น **`REPAIR`**: ระบุประเภทอุปกรณ์, ยี่ห้อ/รุ่น, อาการเสีย, อุปกรณ์ที่ติดมาด้วย, ถ่ายรูปสภาพเครื่อง (เก็บใน Cloudflare R2 สูงสุด 5 รูป)
+  - หากเป็น **`PROJECT`**: ระบุชื่องาน, URL เว็บไซต์ลูกค้า, Scope ย่อ, กำหนดส่ง (Deadline), ลิงก์แนบงาน (Google Drive, Figma, Docs)
+  - หากเป็น **`RETAINER`**: ระบุ URL เว็บไซต์, ขอบเขตงานประจำเดือน, วันที่ตัดรอบบิล (1-31), ค่าบริการต่อเดือน
+- ออกรหัสงานอัตโนมัติ เช่น `PR-2026-0001` (Repair), `PJ-2026-0001` (Project), `RT-2026-0001` (Retainer)
 
-### 2.2 คิวงานและกระดานติดตาม (Unified Job Board)
-- รวมทุกงานในหน้าเดียว หรือกรองดูตามประเภท (`All` | `Repair` | `Project` | `Retainer`)
-- **สถานะงาน (Job Status):**
-  1. `RECEIVED` (รับเรื่อง/รอดำเนินการ)
-  2. `IN_PROGRESS` (กำลังดำเนินการ)
-  3. `WAITING` (รอข้อมูลจากลูกค้า หรือ รออะไหล่)
-  4. `COMPLETED` (ทำเสร็จแล้ว รอส่งมอบ/ส่งรายงาน)
-  5. `DELIVERED` (ส่งมอบงานแล้ว / ปิดจ็อบ)
-- **ระบบเตือนรอบบิลรายเดือน (Retainer Reminder):** แสดงรายการงานรายเดือนที่ใกล้ถึงรอบบิล หรือยังไม่ได้ชำระเงินในรอบปัจจุบัน
-- **ค้นหาด่วน (Quick Search):** ค้นจากชื่อลูกค้า, เบอร์โทร, หรือรหัสงาน
-
-### 2.3 ปิดงานและสรุปการเงิน (Handover & Slip)
-- สรุปยอดเงิน: ค่าบริการ, ค่าอะไหล่/ค่าใช้จ่ายเสริม, ยอดคงเหลือที่ต้องเก็บ
-- บันทึกการรับเงิน: ระบุวิธีชำระและวันที่รับเงิน
-- แสดงหน้าสลิป / ใบสรุปงานดิจิทัล (Clean Mobile Slip View) สำหรับแคปส่ง LINE หรือพิมพ์
+### 2.4 ปิดงานและสรุปการเงิน (Handover & Digital Slip)
+- บันทึกการเงินแบบ Manual: ยอดรวม, เงินมัดจำ/รับแล้ว, ยอดคงค้าง
+- แสดงหน้า **Digital Slip** (การ์ดสรุปงานสำหรับมือถือ) ที่แคปส่ง LINE หรือพิมพ์เป็นกระดาษได้ทันที
 
 ---
 
@@ -46,9 +46,10 @@
 
 - **Framework:** Next.js (App Router)
 - **Runtime:** Cloudflare Pages / Workers
-- **Database:** Cloudflare D1 (SQLite) — ไร้หนี้ทางเทค Zero-ops
-- **Object Storage:** Cloudflare R2 — เก็บรูปถ่ายสภาพเครื่องและเอกสาร
-- **Issue & Task Tracker:** GitHub Issues บน `VivatVibe/Parity2.5`
+- **Database:** Cloudflare D1 (SQLite) — Zero-ops
+- **Object Storage:** Cloudflare R2 — เก็บรูปถ่ายสภาพเครื่อง
+- **Auth:** Google OAuth 2.0
+- **Issue Tracker:** GitHub Issues (`VivatVibe/Parity2.5`)
 - **Development Skills:** Matt Pocock's Ai-Hero skill suite (`setup-matt-pocock-skills`, `grill-with-docs`, `to-spec`, `to-tickets`, `tdd`, `code-review`)
 
 ---
@@ -56,9 +57,19 @@
 ## 4. โครงสร้างข้อมูล (D1 SQLite Schema)
 
 ```sql
+-- ผู้ใช้งานระบบ (Google OAuth & Multi-tenant isolation)
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  avatar_url TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 -- ลูกค้า
 CREATE TABLE clients (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id),
   name TEXT NOT NULL,
   phone TEXT,
   line_id TEXT,
@@ -69,6 +80,7 @@ CREATE TABLE clients (
 -- ใบงานหลัก (Unified Jobs)
 CREATE TABLE jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id),
   job_number TEXT NOT NULL UNIQUE,
   client_id INTEGER NOT NULL REFERENCES clients(id),
   job_type TEXT NOT NULL, -- 'REPAIR', 'PROJECT', 'RETAINER'
@@ -114,7 +126,8 @@ CREATE TABLE job_online_meta (
 
 ---
 
-## 5. กระบวนการพัฒนา (Ai-Hero Delivery Loop)
-1. **Grill & Refine Requirements:** ตรวจสอบความถูกต้องของโมเดลกับผู้ใช้ผ่าน Grilling interview
-2. **Spec & Ticket Breakdown:** แปลง Requirement เป็น Tracer-bullet tickets บน GitHub Issue (`VivatVibe/Parity2.5`)
-3. **TDD Implementation:** พัฒนาฟังก์ชันทีละ Ticket แบบ Test-Driven และผูก verification checks
+## 5. แผนการส่งมอบตามลำดับ (Tracer-bullet Milestones)
+1. **Milestone 1: Core Foundation & Auth** — Schema D1 + Google OAuth login & User session
+2. **Milestone 2: Unified Intake Form** — ฟอร์มรับงานเดียวที่ปรับเปลี่ยนตาม `JobType` (Repair, Project, Retainer) + Client lookup
+3. **Milestone 3: Mission Control Dashboard** — กระดานแสดงผล 3 โซน + Retainer due reminder badge
+4. **Milestone 4: R2 Photos & Digital Slip** — ระบบอัปโหลดรูปกล้องมือถือ + หน้าสรุปสลิปสำหรับส่ง LINE
