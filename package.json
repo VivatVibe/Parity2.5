@@ -5,10 +5,13 @@
 	"packageManager": "npm@10.9.8",
 	"dependencies": {
 		"@vinext/cloudflare": "latest",
+		"arctic": "^3.7.0",
+		"jose": "^6.2.12",
 		"react": "latest",
 		"react-dom": "latest",
 		"react-server-dom-webpack": "latest",
-		"vinext": "latest"
+		"vinext": "latest",
+		"zod": "^4.6.7"
 	},
 	"devDependencies": {
 		"@cloudflare/vite-plugin": "beta",
