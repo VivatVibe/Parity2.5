@@ -3,7 +3,7 @@ import { bindings, defineConfig, defineWorker } from "cf/config";
 export default defineConfig({
   worker: defineWorker({
     name: "parity-app",
-    entrypoint: "vinext/server/fetch-handler",
+    entrypoint: "src/worker.ts",
     compatibilityDate: "2026-10-17",
     compatibilityFlags: ["nodejs_compat"],
     assets: { notFoundHandling: "none" },
@@ -12,7 +12,10 @@ export default defineConfig({
     ],
     env: {
       ASSETS: bindings.assets(),
-      DB: bindings.d1({ name: "parity-db", id: "00000000-0000-0000-0000-000000000000" }),
+      DB: bindings.d1({
+        name: "parity-db",
+        ...(process.env.D1_DATABASE_ID ? { id: process.env.D1_DATABASE_ID } : {}),
+      }),
       PHOTOS: bindings.r2({ name: "parity-photos" }),
     },
   }),

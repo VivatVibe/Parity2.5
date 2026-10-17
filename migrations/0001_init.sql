@@ -56,27 +56,17 @@ CREATE TABLE IF NOT EXISTS job_payments (
   payment_type TEXT NOT NULL, -- 'DEPOSIT', 'MILESTONE', 'FINAL', 'RETAINER_CYCLE'
   billing_period TEXT, -- 'YYYY-MM' e.g. '2026-10' for recurring retainers
   paid_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  note TEXT,
-  idempotency_key TEXT,
-  UNIQUE(user_id, idempotency_key)
+  note TEXT
 );
 
--- 6. Hardware Photos (Cloudflare R2 metadata with quota and lifecycle)
+-- 6. Hardware Photos (Cloudflare R2 metadata)
 CREATE TABLE IF NOT EXISTS job_photos (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  slot_number INTEGER CHECK(slot_number BETWEEN 1 AND 5),
   r2_key TEXT NOT NULL,
   caption TEXT,
-  status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('RESERVED', 'ACTIVE', 'PENDING_DELETE', 'FAILED', 'CLEANING')),
-  cleanup_attempts INTEGER DEFAULT 0,
-  last_cleanup_error TEXT,
-  cleanup_worker_id TEXT,
-  cleanup_generation INTEGER DEFAULT 0,
-  cleanup_lease_expires_at DATETIME,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE(job_id, slot_number)
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Indexes for performance & strict tenant queries
@@ -88,7 +78,4 @@ CREATE INDEX IF NOT EXISTS idx_jobs_user_status ON jobs(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_jobs_user_type ON jobs(user_id, job_type);
 CREATE INDEX IF NOT EXISTS idx_payments_job ON job_payments(job_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_payments_billing ON job_payments(user_id, billing_period);
-CREATE INDEX IF NOT EXISTS idx_payments_idempotency ON job_payments(user_id, idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_photos_job ON job_photos(job_id, user_id);
-CREATE INDEX IF NOT EXISTS idx_photos_status ON job_photos(user_id, status);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_job_slot ON job_photos(job_id, slot_number);
