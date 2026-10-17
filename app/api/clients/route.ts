@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/src/lib/auth";
 import { env } from "cloudflare:workers";
-import { initDatabase, getClients, searchClients, createClient } from "@/src/lib/db";
+import { getClients, searchClients, createClient } from "@/src/lib/db";
 import { z } from "zod";
 
 const CreateClientSchema = z.object({
@@ -14,7 +14,6 @@ const CreateClientSchema = z.object({
 export async function GET(request: Request) {
   try {
     if (!env.DB) return NextResponse.json({ error: "D1 database missing" }, { status: 500 });
-    await initDatabase(env.DB);
 
     const session = await getCurrentUser(request);
     if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -35,7 +34,6 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     if (!env.DB) return NextResponse.json({ error: "D1 database missing" }, { status: 500 });
-    await initDatabase(env.DB);
 
     const session = await getCurrentUser(request);
     if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });

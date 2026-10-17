@@ -153,15 +153,20 @@ export default function JobDetailPage({
 
     try {
       setRecordingPayment(true);
+      const idempotencyKey = crypto.randomUUID();
       const res = await fetch(`/api/jobs/${jobId}/payments`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": idempotencyKey,
+        },
         body: JSON.stringify({
           amount: Number(paymentAmount),
           parts_cost: partsCost === "" ? 0 : Number(partsCost),
           payment_type: paymentType,
           billing_period: paymentType === "RETAINER_CYCLE" ? billingPeriod : undefined,
           note: paymentNote,
+          idempotency_key: idempotencyKey,
         }),
       });
 

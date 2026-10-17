@@ -1,5 +1,6 @@
 import type { D1Database } from "@cloudflare/workers-types";
 import { type JobInput, type JobStatus, parseJobMetadata } from "../schemas/job";
+import { deletePhoto } from "./storage";
 
 export interface UserRecord {
   id: number;
@@ -44,20 +45,23 @@ export interface JobPaymentRecord {
   billing_period?: string;
   paid_at: string;
   note?: string;
+  idempotency_key?: string;
 }
 
 export interface JobPhotoRecord {
   id: number;
   job_id: number;
   user_id: number;
+  slot_number: number;
   r2_key: string;
   caption?: string;
+  status: "RESERVED" | "ACTIVE" | "PENDING_DELETE" | "FAILED";
   created_at: string;
 }
 
 const initializedDbs = new WeakSet<D1Database>();
 
-// 1. Database Schema Initialization (Idempotent Singleton)
+// 1. Database Schema Initialization (Used for local tests & dev migrations)
 export async function initDatabase(db: D1Database): Promise<void> {
   if (initializedDbs.has(db)) return;
   const schema = `
@@ -106,21 +110,26 @@ export async function initDatabase(db: D1Database): Promise<void> {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      amount REAL NOT NULL,
-      parts_cost REAL DEFAULT 0,
+      amount REAL NOT NULL CHECK(amount > 0),
+      parts_cost REAL DEFAULT 0 CHECK(parts_cost >= 0),
       payment_type TEXT NOT NULL,
       billing_period TEXT,
       paid_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      note TEXT
+      note TEXT,
+      idempotency_key TEXT,
+      UNIQUE(user_id, idempotency_key)
     );
 
     CREATE TABLE IF NOT EXISTS job_photos (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      slot_number INTEGER NOT NULL CHECK(slot_number BETWEEN 1 AND 5),
       r2_key TEXT NOT NULL,
       caption TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('RESERVED', 'ACTIVE', 'PENDING_DELETE', 'FAILED')),
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(job_id, slot_number)
     );
 
     CREATE INDEX IF NOT EXISTS idx_clients_user ON clients(user_id);
@@ -131,7 +140,10 @@ export async function initDatabase(db: D1Database): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_jobs_user_type ON jobs(user_id, job_type);
     CREATE INDEX IF NOT EXISTS idx_payments_job ON job_payments(job_id, user_id);
     CREATE INDEX IF NOT EXISTS idx_payments_billing ON job_payments(user_id, billing_period);
+    CREATE INDEX IF NOT EXISTS idx_payments_idempotency ON job_payments(user_id, idempotency_key);
     CREATE INDEX IF NOT EXISTS idx_photos_job ON job_photos(job_id, user_id);
+    CREATE INDEX IF NOT EXISTS idx_photos_status ON job_photos(user_id, status);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_job_slot ON job_photos(job_id, slot_number);
   `;
 
   const statements = schema
@@ -369,13 +381,15 @@ export async function getJobFinancialSummary(
     }).format(new Date());
 
     currentCyclePeriod = currentYearMonth;
+    const monthlyRate = Number(parsedMeta?.monthlyRate) || totalQuotedAmount;
+
     const currentCyclePaidAmount = jobPayments
       .filter((p) => p.payment_type === "RETAINER_CYCLE" && p.billing_period === currentYearMonth)
       .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
 
-    currentCyclePaid = currentCyclePaidAmount >= totalQuotedAmount && totalQuotedAmount > 0;
-    balanceDue = Math.max(0, totalQuotedAmount - currentCyclePaidAmount);
-    isPaidInFull = totalQuotedAmount > 0 && balanceDue === 0;
+    currentCyclePaid = currentCyclePaidAmount >= monthlyRate && monthlyRate > 0;
+    balanceDue = Math.max(0, monthlyRate - currentCyclePaidAmount);
+    isPaidInFull = monthlyRate > 0 && balanceDue === 0;
   }
 
   return {
@@ -437,14 +451,23 @@ export async function updateJobStatus(
   jobId: number,
   status: JobStatus
 ): Promise<boolean> {
+  // Strict tenant verification: verify job exists and belongs to this user
+  const job = await db
+    .prepare("SELECT id FROM jobs WHERE id = ? AND user_id = ?")
+    .bind(jobId, userId)
+    .first<{ id: number }>();
+
+  if (!job) return false;
+
   const res = await db
     .prepare("UPDATE jobs SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?")
     .bind(status, jobId, userId)
     .run();
+
   return res.success;
 }
 
-// 6. Payment Operations (Financial Ledger)
+// 6. Payment Operations (Financial Ledger with DATA-03 Idempotency)
 export async function addJobPayment(
   db: D1Database,
   userId: number,
@@ -455,8 +478,9 @@ export async function addJobPayment(
     paymentType: "DEPOSIT" | "MILESTONE" | "FINAL" | "RETAINER_CYCLE";
     billingPeriod?: string;
     note?: string;
+    idempotencyKey?: string;
   }
-): Promise<JobPaymentRecord> {
+): Promise<JobPaymentRecord & { isIdempotentReplay?: boolean }> {
   // Strict Tenant Isolation: verify job exists and belongs to this user
   const job = await db
     .prepare("SELECT id FROM jobs WHERE id = ? AND user_id = ?")
@@ -467,25 +491,79 @@ export async function addJobPayment(
     throw new Error(`Job ID ${payment.jobId} not found or does not belong to user ${userId}`);
   }
 
-  const res = await db
-    .prepare(
-      `INSERT INTO job_payments (
-        job_id, user_id, amount, parts_cost, payment_type, billing_period, note
-      ) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`
-    )
-    .bind(
-      payment.jobId,
-      userId,
-      payment.amount,
-      payment.partsCost || 0,
-      payment.paymentType,
-      payment.billingPeriod || null,
-      payment.note || null
-    )
-    .first<JobPaymentRecord>();
+  if (payment.amount <= 0) {
+    throw new Error("Payment amount must be greater than 0");
+  }
 
-  if (!res) throw new Error("Failed to record payment");
-  return res;
+  const idempotencyKey = payment.idempotencyKey ? payment.idempotencyKey.trim() : null;
+
+  // DATA-03: If idempotency key provided, check for existing entry
+  if (idempotencyKey) {
+    const existing = await db
+      .prepare("SELECT * FROM job_payments WHERE user_id = ? AND idempotency_key = ?")
+      .bind(userId, idempotencyKey)
+      .first<JobPaymentRecord>();
+
+    if (existing) {
+      const isMatch =
+        existing.job_id === payment.jobId &&
+        Number(existing.amount) === Number(payment.amount) &&
+        existing.payment_type === payment.paymentType &&
+        (existing.billing_period || null) === (payment.billingPeriod || null);
+
+      if (isMatch) {
+        return { ...existing, isIdempotentReplay: true };
+      } else {
+        throw new Error("IDEMPOTENCY_CONFLICT: Key reused with conflicting payment parameters");
+      }
+    }
+  }
+
+  try {
+    const res = await db
+      .prepare(
+        `INSERT INTO job_payments (
+          job_id, user_id, amount, parts_cost, payment_type, billing_period, note, idempotency_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
+      )
+      .bind(
+        payment.jobId,
+        userId,
+        payment.amount,
+        payment.partsCost || 0,
+        payment.paymentType,
+        payment.billingPeriod || null,
+        payment.note || null,
+        idempotencyKey
+      )
+      .first<JobPaymentRecord>();
+
+    if (!res) throw new Error("Failed to record payment");
+    return res;
+  } catch (err: any) {
+    // If unique constraint collision triggered under race conditions:
+    if (idempotencyKey && err.message && (err.message.includes("UNIQUE") || err.message.includes("constraint"))) {
+      const existing = await db
+        .prepare("SELECT * FROM job_payments WHERE user_id = ? AND idempotency_key = ?")
+        .bind(userId, idempotencyKey)
+        .first<JobPaymentRecord>();
+
+      if (existing) {
+        const isMatch =
+          existing.job_id === payment.jobId &&
+          Number(existing.amount) === Number(payment.amount) &&
+          existing.payment_type === payment.paymentType &&
+          (existing.billing_period || null) === (payment.billingPeriod || null);
+
+        if (isMatch) {
+          return { ...existing, isIdempotentReplay: true };
+        } else {
+          throw new Error("IDEMPOTENCY_CONFLICT: Key reused with conflicting payment parameters");
+        }
+      }
+    }
+    throw err;
+  }
 }
 
 export async function getJobPayments(
@@ -500,45 +578,40 @@ export async function getJobPayments(
   return results || [];
 }
 
-// 7. Photo Operations (R2 Storage & 5-Photo Quota)
+// 7. Photo Operations (Atomic Reservation, Quota & Durable Lifecycle)
 export async function getJobPhotos(
   db: D1Database,
   userId: number,
   jobId: number
 ): Promise<JobPhotoRecord[]> {
   const { results } = await db
-    .prepare("SELECT * FROM job_photos WHERE job_id = ? AND user_id = ? ORDER BY id ASC")
+    .prepare(
+      "SELECT * FROM job_photos WHERE job_id = ? AND user_id = ? AND status = 'ACTIVE' ORDER BY slot_number ASC, id ASC"
+    )
     .bind(jobId, userId)
     .all<JobPhotoRecord>();
   return results || [];
 }
 
-export async function getJobPhotosForJob(
-  db: D1Database,
-  jobId: number
-): Promise<JobPhotoRecord[]> {
-  const { results } = await db
-    .prepare("SELECT * FROM job_photos WHERE job_id = ? ORDER BY id ASC")
-    .bind(jobId)
-    .all<JobPhotoRecord>();
-  return results || [];
-}
-
+/**
+ * SEC-02: Strictly require tenant ownership for photo lookup.
+ * Unsafe optional userId is removed; userId is strictly required.
+ */
 export async function getJobPhotoById(
   db: D1Database,
   jobId: number,
   photoId: number,
-  userId?: number
+  userId: number
 ): Promise<JobPhotoRecord | null> {
-  let query = "SELECT * FROM job_photos WHERE id = ? AND job_id = ?";
-  const params: any[] = [photoId, jobId];
-
-  if (userId !== undefined) {
-    query += " AND user_id = ?";
-    params.push(userId);
+  if (typeof userId !== "number" || isNaN(userId) || userId <= 0) {
+    throw new Error("Tenant userId is strictly required for photo lookup");
   }
 
-  const photo = await db.prepare(query).bind(...params).first<JobPhotoRecord>();
+  const photo = await db
+    .prepare("SELECT * FROM job_photos WHERE id = ? AND job_id = ? AND user_id = ?")
+    .bind(photoId, jobId, userId)
+    .first<JobPhotoRecord>();
+
   return photo || null;
 }
 
@@ -557,7 +630,10 @@ export async function validatePhotoUploadQuota(
   }
 
   const countResult = await db
-    .prepare("SELECT COUNT(*) as count FROM job_photos WHERE job_id = ? AND user_id = ?")
+    .prepare(
+      `SELECT COUNT(*) as count FROM job_photos 
+       WHERE job_id = ? AND user_id = ? AND status IN ('ACTIVE', 'RESERVED')`
+    )
     .bind(jobId, userId)
     .first<{ count: number }>();
 
@@ -567,6 +643,169 @@ export async function validatePhotoUploadQuota(
   }
 }
 
+/**
+ * DATA-01 & DATA-02: Atomically reserve a photo slot (1..5) in D1 before streaming to R2.
+ */
+export async function reservePhotoSlot(
+  db: D1Database,
+  userId: number,
+  jobId: number,
+  r2Key: string,
+  caption?: string
+): Promise<JobPhotoRecord> {
+  const job = await db
+    .prepare("SELECT id FROM jobs WHERE id = ? AND user_id = ?")
+    .bind(jobId, userId)
+    .first<{ id: number }>();
+
+  if (!job) {
+    throw new Error(`Job ID ${jobId} not found or does not belong to user ${userId}`);
+  }
+
+  // Fetch current occupied slots
+  const existingRows = await db
+    .prepare(
+      `SELECT id, slot_number, status, created_at FROM job_photos 
+       WHERE job_id = ? AND user_id = ? AND status IN ('ACTIVE', 'RESERVED')`
+    )
+    .bind(jobId, userId)
+    .all<{ id: number; slot_number: number; status: string; created_at: string }>();
+
+  const occupiedSlots = new Set<number>();
+  const now = Date.now();
+
+  for (const row of existingRows.results || []) {
+    // If RESERVED and older than 5 minutes, consider it expired and clean it up
+    const createdAtMs = new Date(row.created_at + (row.created_at.endsWith("Z") ? "" : "Z")).getTime();
+    const isExpired = row.status === "RESERVED" && now - createdAtMs > 5 * 60 * 1000;
+    if (isExpired) {
+      await db.prepare("DELETE FROM job_photos WHERE id = ?").bind(row.id).run();
+    } else {
+      occupiedSlots.add(row.slot_number);
+    }
+  }
+
+  if (occupiedSlots.size >= 5) {
+    throw new Error("อัปโหลดรูปภาพได้สูงสุด 5 รูปต่อใบงาน (Max 5 photos reached)");
+  }
+
+  // Find lowest free slot (1..5)
+  let chosenSlot = -1;
+  for (let s = 1; s <= 5; s++) {
+    if (!occupiedSlots.has(s)) {
+      chosenSlot = s;
+      break;
+    }
+  }
+
+  if (chosenSlot === -1) {
+    throw new Error("อัปโหลดรูปภาพได้สูงสุด 5 รูปต่อใบงาน (Max 5 photos reached)");
+  }
+
+  try {
+    const res = await db
+      .prepare(
+        `INSERT INTO job_photos (job_id, user_id, slot_number, r2_key, caption, status)
+         VALUES (?, ?, ?, ?, ?, 'RESERVED') RETURNING *`
+      )
+      .bind(jobId, userId, chosenSlot, r2Key, caption || null)
+      .first<JobPhotoRecord>();
+
+    if (!res) throw new Error("Failed to reserve photo slot");
+    return res;
+  } catch (err: any) {
+    // Handle concurrent contender race condition
+    if (err.message && (err.message.includes("UNIQUE") || err.message.includes("constraint"))) {
+      const retrySlots = await db
+        .prepare(
+          `SELECT slot_number FROM job_photos 
+           WHERE job_id = ? AND user_id = ? AND status IN ('ACTIVE', 'RESERVED')`
+        )
+        .bind(jobId, userId)
+        .all<{ slot_number: number }>();
+      const currentOccupied = new Set((retrySlots.results || []).map((r) => r.slot_number));
+      if (currentOccupied.size >= 5) {
+        throw new Error("อัปโหลดรูปภาพได้สูงสุด 5 รูปต่อใบงาน (Max 5 photos reached)");
+      }
+      for (let s = 1; s <= 5; s++) {
+        if (!currentOccupied.has(s)) {
+          const resRetry = await db
+            .prepare(
+              `INSERT INTO job_photos (job_id, user_id, slot_number, r2_key, caption, status)
+               VALUES (?, ?, ?, ?, ?, 'RESERVED') RETURNING *`
+            )
+            .bind(jobId, userId, s, r2Key, caption || null)
+            .first<JobPhotoRecord>();
+          if (resRetry) return resRetry;
+        }
+      }
+      throw new Error("อัปโหลดรูปภาพได้สูงสุด 5 รูปต่อใบงาน (Max 5 photos reached)");
+    }
+    throw err;
+  }
+}
+
+export async function activatePhotoSlot(
+  db: D1Database,
+  userId: number,
+  photoId: number
+): Promise<JobPhotoRecord> {
+  const res = await db
+    .prepare(
+      `UPDATE job_photos SET status = 'ACTIVE' 
+       WHERE id = ? AND user_id = ? AND status = 'RESERVED' 
+       RETURNING *`
+    )
+    .bind(photoId, userId)
+    .first<JobPhotoRecord>();
+
+  if (!res) throw new Error("Failed to activate photo record or photo not in RESERVED state");
+  return res;
+}
+
+export async function failPhotoSlot(
+  db: D1Database,
+  userId: number,
+  photoId: number
+): Promise<void> {
+  await db
+    .prepare("DELETE FROM job_photos WHERE id = ? AND user_id = ? AND status = 'RESERVED'")
+    .bind(photoId, userId)
+    .run();
+}
+
+export async function markPhotoForDeletion(
+  db: D1Database,
+  userId: number,
+  jobId: number,
+  photoId: number
+): Promise<JobPhotoRecord> {
+  const photo = await db
+    .prepare(
+      `UPDATE job_photos SET status = 'PENDING_DELETE' 
+       WHERE id = ? AND job_id = ? AND user_id = ? 
+       RETURNING *`
+    )
+    .bind(photoId, jobId, userId)
+    .first<JobPhotoRecord>();
+
+  if (!photo) {
+    throw new Error(`Photo ID ${photoId} not found or does not belong to user ${userId}`);
+  }
+  return photo;
+}
+
+export async function finalizePhotoDeletion(
+  db: D1Database,
+  userId: number,
+  photoId: number
+): Promise<void> {
+  await db
+    .prepare("DELETE FROM job_photos WHERE id = ? AND user_id = ?")
+    .bind(photoId, userId)
+    .run();
+}
+
 export async function createJobPhoto(
   db: D1Database,
   userId: number,
@@ -574,18 +813,8 @@ export async function createJobPhoto(
   r2Key: string,
   caption?: string
 ): Promise<JobPhotoRecord> {
-  // Strict Tenant Isolation & Quota Check
-  await validatePhotoUploadQuota(db, userId, jobId);
-
-  const res = await db
-    .prepare(
-      "INSERT INTO job_photos (job_id, user_id, r2_key, caption) VALUES (?, ?, ?, ?) RETURNING *"
-    )
-    .bind(jobId, userId, r2Key, caption || null)
-    .first<JobPhotoRecord>();
-
-  if (!res) throw new Error("Failed to insert photo record");
-  return res;
+  const reserved = await reservePhotoSlot(db, userId, jobId, r2Key, caption);
+  return await activatePhotoSlot(db, userId, reserved.id);
 }
 
 export async function deleteJobPhoto(
@@ -594,22 +823,47 @@ export async function deleteJobPhoto(
   jobId: number,
   photoId: number
 ): Promise<JobPhotoRecord> {
-  // Find photo and verify tenant ownership
-  const photo = await db
-    .prepare("SELECT * FROM job_photos WHERE id = ? AND job_id = ? AND user_id = ?")
-    .bind(photoId, jobId, userId)
-    .first<JobPhotoRecord>();
+  const marked = await markPhotoForDeletion(db, userId, jobId, photoId);
+  await finalizePhotoDeletion(db, userId, photoId);
+  return marked;
+}
 
-  if (!photo) {
-    throw new Error(`Photo ID ${photoId} not found or does not belong to user ${userId}`);
+export async function cleanupOrphanedPhotos(
+  db: D1Database,
+  r2: any,
+  userId?: number
+): Promise<{ cleanedCount: number }> {
+  let query = `
+    SELECT id, user_id, r2_key, status, created_at FROM job_photos 
+    WHERE status = 'PENDING_DELETE' 
+       OR (status = 'RESERVED' AND created_at < datetime('now', '-5 minutes'))
+  `;
+  const params: any[] = [];
+  if (userId !== undefined) {
+    query += " AND user_id = ?";
+    params.push(userId);
   }
 
-  await db
-    .prepare("DELETE FROM job_photos WHERE id = ? AND user_id = ?")
-    .bind(photoId, userId)
-    .run();
+  const { results } = await db.prepare(query).bind(...params).all<{
+    id: number;
+    user_id: number;
+    r2_key: string;
+    status: string;
+    created_at: string;
+  }>();
 
-  return photo;
+  let cleanedCount = 0;
+  for (const row of results || []) {
+    try {
+      await deletePhoto(r2, row.r2_key);
+    } catch (e) {
+      // Continue cleanup even if R2 delete fails
+    }
+    await db.prepare("DELETE FROM job_photos WHERE id = ?").bind(row.id).run();
+    cleanedCount++;
+  }
+
+  return { cleanedCount };
 }
 
 // 8. Mission Control Dashboard Aggregation (Zero N+1 Queries)
@@ -676,23 +930,25 @@ export async function getDashboardData(
     day: "2-digit",
   }).format(new Date());
 
-  // 1. Aggregated query for monthly revenue and parts cost
+  // FIN-02: Timezone aligned with Asia/Bangkok (+7 hours) in SQLite
+  // Query 1: Monthly KPI aggregates
   const kpiRow = await db
     .prepare(
       `SELECT 
         COALESCE(SUM(amount), 0) as monthly_revenue,
         COALESCE(SUM(parts_cost), 0) as monthly_parts_cost
        FROM job_payments 
-       WHERE user_id = ? AND strftime('%Y-%m', paid_at) = ?`
+       WHERE user_id = ? AND strftime('%Y-%m', datetime(paid_at, '+7 hours')) = ?`
     )
     .bind(userId, currentBangkokMonth)
     .first<{ monthly_revenue: number; monthly_parts_cost: number }>();
 
   const monthlyRevenue = kpiRow?.monthly_revenue ?? 0;
   const monthlyPartsCost = kpiRow?.monthly_parts_cost ?? 0;
+  // Direct Contribution Margin before overhead
   const monthlyProfit = monthlyRevenue - monthlyPartsCost;
 
-  // 2. Aggregated query for all jobs with clients and payment sums (Zero N+1)
+  // Query 2: All jobs joined with clients and payment sums in single query (Zero N+1)
   let jobsQuery = `
     SELECT 
       j.id,
@@ -828,7 +1084,7 @@ export async function getDashboardData(
   // Sort Retainers: Unpaid on top, then by billingCycleDay
   retainers.sort((a, b) => {
     if (a.currentCyclePaid !== b.currentCyclePaid) {
-      return a.currentCyclePaid ? 1 : -1; // unpaid first
+      return a.currentCyclePaid ? 1 : -1;
     }
     const dayA = a.parsedMetadata?.billingCycleDay || 1;
     const dayB = b.parsedMetadata?.billingCycleDay || 1;

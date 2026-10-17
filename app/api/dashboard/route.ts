@@ -1,12 +1,11 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/src/lib/auth";
 import { env } from "cloudflare:workers";
-import { initDatabase, getDashboardData } from "@/src/lib/db";
+import { getDashboardData } from "@/src/lib/db";
 
 export async function GET(request: Request) {
   try {
     if (!env.DB) return NextResponse.json({ error: "D1 database missing" }, { status: 500 });
-    await initDatabase(env.DB);
 
     const session = await getCurrentUser(request);
     if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
