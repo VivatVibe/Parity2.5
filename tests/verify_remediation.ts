@@ -1635,8 +1635,8 @@ async function runRemediationVerification() {
   );
   assert.strictEqual(finalizeStale, false, "finalizePhotoDeletion must return false when lease expired");
 
-  // Now verify that handlePhotoDeletionRequest returns status 409 when finalization fails
-  // Prepare a row with a short-lived lease that expires during deletion
+  // Subcase 7c (R9-T1): In-flight stall during R2 deletion past lease TTL -> handlePhotoDeletionRequest returns HTTP 409
+  // Prepare a row with an active photo
   const key7c = `users/${user1.id}/jobs/${testJob.id}/interleave-7c.webp`;
   await putPhoto(null, key7c, testPayload, "image/webp");
   const row7c = sqlite.prepare(`
@@ -1645,14 +1645,18 @@ async function runRemediationVerification() {
     RETURNING id
   `).get(testJob.id, user1.id, key7c) as any;
 
-  // Claim with 0-minute lease (already expired)
-  const worker7c = "http-stalled-worker";
-  const claimed7c = await claimPhotoForDeletion(db, user1.id, testJob.id, row7c.id, worker7c, 0);
-  // Force lease expiry into past
-  sqlite.prepare("UPDATE job_photos SET cleanup_lease_expires_at = datetime('now', '-1 second') WHERE id = ?").run(row7c.id);
+  // In-flight deferred mock R2 delete: simulates network stall past the 2m lease
+  const deferredR2 = {
+    delete: async (key: string) => {
+      // Simulate stall: force lease expiration in D1 while delete is in-flight
+      sqlite.prepare("UPDATE job_photos SET cleanup_lease_expires_at = datetime('now', '-1 minute') WHERE id = ?").run(row7c.id);
+      await deletePhoto(null, key);
+    },
+  };
 
-  const staleFinResult = await finalizePhotoDeletion(db, user1.id, row7c.id, worker7c, claimed7c.cleanup_generation);
-  assert.strictEqual(staleFinResult, false, "Expired lease finalization must return false");
+  const res7c = await handlePhotoDeletionRequest(db, deferredR2, user1.id, testJob.id, row7c.id, "deferred-worker-7c");
+  assert.strictEqual(res7c.status, 409, "handlePhotoDeletionRequest must return HTTP 409 when lease expires during in-flight R2 delete");
+  assert.ok(res7c.body.error?.includes("lease expired"), "Error message explains lease expiration");
 
   // Subcase 7d: Successful end-to-end HTTP photo deletion via handlePhotoDeletionRequest
   const key7d = `users/${user1.id}/jobs/${testJob.id}/interleave-7d.webp`;
@@ -1692,7 +1696,8 @@ async function runRemediationVerification() {
     user1.id,
     rowFail.id,
     failKey,
-    new Error("Activation timeout")
+    new Error("Activation timeout"),
+    testJob.id
   );
 
   // Verify row was NOT discarded from D1, but transitioned to PENDING_DELETE with diagnostic error
@@ -1707,7 +1712,7 @@ async function runRemediationVerification() {
   const postSweeperRow = sqlite.prepare("SELECT id FROM job_photos WHERE id = ?").get(rowFail.id);
   assert.strictEqual(postSweeperRow, undefined, "Row successfully pruned after sweeper retry");
 
-  // Subcase 7f (R8-A3): reconcileR2Storage enforces 60-minute safety bound floor
+  // Subcase 7f (R8-A3 & R9-T1): reconcileR2Storage enforces 60-minute safety bound floor with production clamping
   const recentKey = `users/${user1.id}/jobs/${testJob.id}/grace-recent-${Date.now()}.webp`;
   const agedKey = `users/${user1.id}/jobs/${testJob.id}/grace-aged-${Date.now()}.webp`;
   // Upload recentKey 10 minutes ago (< 60m grace)
@@ -1719,7 +1724,7 @@ async function runRemediationVerification() {
     uploaded: new Date(Date.now() - 120 * 60 * 1000),
   });
 
-  // Reconcile with default 60m grace: recentKey preserved, agedKey purged
+  // Verify default 60m grace: recentKey preserved, agedKey purged
   const graceRecResult = await reconcileR2Storage(null, db, {
     prefix: `users/${user1.id}/jobs/${testJob.id}/grace-`,
     safetyGracePeriodMs: MIN_SAFETY_GRACE_PERIOD_MS,
@@ -1729,10 +1734,107 @@ async function runRemediationVerification() {
   assert.ok((await getPhoto(null, recentKey)) !== null, "Recent object remains in R2");
   assert.strictEqual(await getPhoto(null, agedKey), null, "Aged object purged from R2");
 
+  // R9-T1: Prove production clamping: when NODE_ENV === 'production' and caller requests safetyGracePeriodMs: 0,
+  // reconcileR2Storage strictly clamps to MIN_SAFETY_GRACE_PERIOD_MS (60m) and preserves recent object
+  const origNodeEnv = process.env.NODE_ENV;
+  try {
+    process.env.NODE_ENV = "production";
+    const prodStorage = new Map<string, { data: Uint8Array; uploaded: Date }>();
+    prodStorage.set(recentKey, { data: testPayload, uploaded: new Date(Date.now() - 10 * 60 * 1000) });
+    const prodAgedKey = `users/${user1.id}/jobs/${testJob.id}/grace-aged-prod-${Date.now()}.webp`;
+    prodStorage.set(prodAgedKey, { data: testPayload, uploaded: new Date(Date.now() - 120 * 60 * 1000) });
+
+    const prodMockR2 = {
+      list: async (opts?: any) => {
+        const objs: { key: string; uploaded: Date }[] = [];
+        for (const [k, v] of prodStorage.entries()) {
+          if (!opts?.prefix || k.startsWith(opts.prefix)) {
+            objs.push({ key: k, uploaded: v.uploaded });
+          }
+        }
+        return { objects: objs, truncated: false };
+      },
+      delete: async (k: string) => {
+        prodStorage.delete(k);
+      },
+    };
+
+    const prodClampedResult = await reconcileR2Storage(prodMockR2, db, {
+      prefix: `users/${user1.id}/jobs/${testJob.id}/grace-`,
+      safetyGracePeriodMs: 0, // Attempt to bypass grace period in production
+    });
+    assert.ok(prodClampedResult.deletedOrphans.includes(prodAgedKey), "Aged orphan (>60m) purged in production");
+    assert.ok(!prodClampedResult.deletedOrphans.includes(recentKey), "Production mode strictly clamps 0ms to 60m floor and preserves recent object");
+    assert.ok(prodStorage.has(recentKey), "Recent object safely preserved under production clamp");
+    assert.ok(!prodStorage.has(prodAgedKey), "Aged object purged from R2 storage");
+  } finally {
+    process.env.NODE_ENV = origNodeEnv;
+  }
+
   // Clean up recentKey
   await deletePhoto(null, recentKey);
 
-  console.log("  ✓ Scenario 7: Unified deletion ownership, exclusive lease fencing, durable upload retry, and 60m grace floor verified");
+  // Subcase 7g (R9-03): HTTP DELETE failure records diagnostic metadata in D1 and allows sweeper recovery after lease expiry
+  const key7g = `users/${user1.id}/jobs/${testJob.id}/http-fail-7g.webp`;
+  await putPhoto(null, key7g, testPayload, "image/webp");
+  const row7g = sqlite.prepare(`
+    INSERT INTO job_photos (job_id, user_id, r2_key, status, created_at)
+    VALUES (?, ?, ?, 'ACTIVE', datetime('now'))
+    RETURNING id
+  `).get(testJob.id, user1.id, key7g) as any;
+
+  const failingHttpR2 = {
+    delete: async () => {
+      throw new Error("R2 503 Service Unavailable");
+    },
+  };
+
+  const res7g = await handlePhotoDeletionRequest(db, failingHttpR2, user1.id, testJob.id, row7g.id);
+  assert.strictEqual(res7g.status, 502, "HTTP DELETE returns 502 on storage failure");
+
+  const row7gCheck = sqlite.prepare("SELECT status, cleanup_attempts, last_cleanup_error, cleanup_lease_expires_at FROM job_photos WHERE id = ?").get(row7g.id) as any;
+  assert.strictEqual(row7gCheck.status, "CLEANING", "Row remains in CLEANING with active lease");
+  assert.strictEqual(row7gCheck.cleanup_attempts, 1, "cleanup_attempts incremented in D1");
+  assert.ok(row7gCheck.last_cleanup_error.includes("503 Service Unavailable"), "Diagnostic error recorded in D1");
+
+  // Force lease expiry to test background sweeper recovery
+  sqlite.prepare("UPDATE job_photos SET cleanup_lease_expires_at = datetime('now', '-1 minute') WHERE id = ?").run(row7g.id);
+  const sweeperRecovery7g = await cleanupOrphanedPhotos(db, null, user1.id, "sweeper-recovery-7g");
+  assert.ok(sweeperRecovery7g.cleanedCount >= 1, "Sweeper recovers and cleans up photo after lease expiry");
+  assert.strictEqual(sqlite.prepare("SELECT id FROM job_photos WHERE id = ?").get(row7g.id), undefined);
+  await deletePhoto(null, key7g);
+
+  // Subcase 7h (R9-02): Upload cleanup recovery creates durable PENDING_DELETE tombstone if reservation already purged
+  const purgedSlotKey = `users/${user1.id}/jobs/${testJob.id}/purged-slot.webp`;
+  const nonExistentSlotId = 999999; // D1 row does not exist (sweeper purged it while upload was delayed)
+  const failingUploadR2ForPurged = {
+    delete: async () => {
+      throw new Error("R2 500 downstream network timeout");
+    },
+  };
+
+  await handlePhotoUploadActivationFailure(
+    db,
+    failingUploadR2ForPurged,
+    user1.id,
+    nonExistentSlotId,
+    purgedSlotKey,
+    new Error("Upload activation failed"),
+    testJob.id
+  );
+
+  // Verify that a tombstone row was inserted into job_photos with status 'PENDING_DELETE' and diagnostic error!
+  const tombstone = sqlite.prepare("SELECT * FROM job_photos WHERE r2_key = ?").get(purgedSlotKey) as any;
+  assert.ok(tombstone !== undefined, "Tombstone row MUST be inserted when D1 reservation is missing");
+  assert.strictEqual(tombstone.status, "PENDING_DELETE", "Tombstone status must be PENDING_DELETE");
+  assert.ok(tombstone.last_cleanup_error.includes("Orphan recovery"), "Diagnostic error recorded in tombstone");
+
+  // Sweeper now cleans up the tombstone
+  const tombstoneCleanup = await cleanupOrphanedPhotos(db, null, user1.id, "sweeper-tombstone");
+  assert.ok(tombstoneCleanup.cleanedCount >= 1, "Sweeper successfully cleans up tombstone orphan");
+  assert.strictEqual(sqlite.prepare("SELECT id FROM job_photos WHERE id = ?").get(purgedSlotKey), undefined);
+
+  console.log("  ✓ Scenario 7: Unified deletion ownership, exclusive lease fencing, deferred in-flight 409, durable retry, and production 60m clamping verified");
 
   // =========================================================================
   // 11. BLOCKER B: Scheduled Reconciliation Runtime Wiring Verification

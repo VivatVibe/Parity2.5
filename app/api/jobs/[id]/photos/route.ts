@@ -107,7 +107,8 @@ export async function POST(
         session.userId,
         reservedPhoto.id,
         r2Key,
-        actErr
+        actErr,
+        jobId
       );
       throw actErr;
     }

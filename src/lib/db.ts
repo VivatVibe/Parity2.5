@@ -867,9 +867,11 @@ export async function claimPhotoForDeletion(
   workerId: string,
   leaseMinutes = 2
 ): Promise<JobPhotoRecord> {
-  // R8-A2: Exclusive deletion ownership protocol.
-  // Atomically claim the photo into 'CLEANING' status with exclusive worker ownership,
-  // incremented generation token, and an active lease.
+  // R8-A2 / R9-01: Exclusive deletion ownership protocol.
+  // Distributed safety invariant:
+  // - At-most-one valid D1 lease owner: D1 atomic CAS guarantees at-most-one worker holds an active lease and can finalize.
+  // - Idempotent external R2 deletion: Keys are immutable UUIDs; if a lease expires while an R2 delete is in flight,
+  //   subsequent background sweeper DELETE is idempotent.
   // Fails if the row is already locked by another cleaner holding an unexpired lease.
   const photo = await db
     .prepare(
@@ -912,11 +914,13 @@ export async function markPhotoSlotForCleanupRetry(
   db: D1Database,
   userId: number,
   photoId: number,
-  lastError: string
+  lastError: string,
+  r2Key?: string,
+  jobId?: number
 ): Promise<void> {
-  // R8-A3: Durable failure recording.
+  // R8-A3 / R9-02: Durable failure recording.
   // Preserves photo reference in PENDING_DELETE with diagnostic error so background sweeper retries R2 deletion.
-  await db
+  const res = await db
     .prepare(
       `UPDATE job_photos 
        SET status = 'PENDING_DELETE', 
@@ -927,6 +931,22 @@ export async function markPhotoSlotForCleanupRetry(
     )
     .bind(lastError, photoId, userId)
     .run();
+
+  const changes = (res as any)?.changes ?? (res as any)?.meta?.changes ?? 0;
+  if (changes === 0 && r2Key) {
+    // R9-02: If reservation row was already purged by sweeper (>5m), insert tombstone record
+    // with status 'PENDING_DELETE' so background sweeper still has a durable D1 row to retry R2 deletion.
+    const derivedJobId = jobId || Number(r2Key.match(/jobs\/(\d+)\//)?.[1]) || null;
+    if (derivedJobId) {
+      await db
+        .prepare(
+          `INSERT INTO job_photos (job_id, user_id, slot_number, r2_key, status, cleanup_attempts, last_cleanup_error)
+           VALUES (?, ?, NULL, ?, 'PENDING_DELETE', 1, ?)`
+        )
+        .bind(derivedJobId, userId, r2Key, `Orphan recovery: ${lastError}`)
+        .run();
+    }
+  }
 }
 
 export async function finalizePhotoDeletion(
@@ -1015,8 +1035,28 @@ export async function handlePhotoDeletionRequest(
     };
   }
 
-  // Delete from R2 storage under verified exclusive lease
-  await deletePhoto(r2, claimedPhoto.r2_key);
+  // R9-01 Invariant: At-most-one valid D1 lease owner + idempotent external R2 deletion on immutable UUID keys.
+  // D1 CAS generation fencing guarantees at-most-one worker can successfully finalize row deletion.
+  // In the event of lease expiry during in-flight external R2 deletion, concurrent DELETEs to the same immutable UUID key are idempotent.
+  try {
+    await deletePhoto(r2, claimedPhoto.r2_key);
+  } catch (r2Err: any) {
+    // R9-03: Catch R2 deletion failure and record diagnostic metadata in D1 under current worker ownership/lease
+    await db
+      .prepare(
+        `UPDATE job_photos 
+         SET cleanup_attempts = COALESCE(cleanup_attempts, 0) + 1,
+             last_cleanup_error = ?
+         WHERE id = ? AND user_id = ? AND cleanup_worker_id = ?`
+      )
+      .bind(r2Err?.message || "R2 delete failed", photoId, userId, workerId)
+      .run();
+
+    return {
+      status: 502,
+      body: { error: `Storage deletion failed: ${r2Err?.message || "Unknown R2 error"}` },
+    };
+  }
 
   // R8-A1: Finalize deletion in D1 verifying active lease and generation ownership
   const finalized = await finalizePhotoDeletion(
@@ -1047,11 +1087,12 @@ export async function handlePhotoUploadActivationFailure(
   userId: number,
   slotId: number,
   r2Key: string,
-  activationError: any
+  activationError: any,
+  jobId?: number
 ): Promise<void> {
-  // R8-A3: Durable cleanup on activation failure.
+  // R8-A3 / R9-02: Durable cleanup on activation failure.
   // If R2 deletion succeeds, purge the reservation immediately via failPhotoSlot.
-  // If R2 deletion fails, preserve row as PENDING_DELETE with diagnostic error for sweeper retry.
+  // If R2 deletion fails, preserve or insert row as PENDING_DELETE with diagnostic error for sweeper retry.
   let r2Deleted = false;
   try {
     await deletePhoto(r2, r2Key);
@@ -1061,11 +1102,25 @@ export async function handlePhotoUploadActivationFailure(
       db,
       userId,
       slotId,
-      r2Err?.message || "R2 cleanup failed"
+      r2Err?.message || "R2 cleanup failed",
+      r2Key,
+      jobId
     );
   }
   if (r2Deleted) {
-    await failPhotoSlot(db, userId, slotId);
+    try {
+      await failPhotoSlot(db, userId, slotId);
+    } catch {
+      // If failPhotoSlot fails (e.g. transient D1 error or already purged), mark status to avoid stuck slot
+      try {
+        await db
+          .prepare("UPDATE job_photos SET status = 'FAILED', slot_number = NULL WHERE id = ? AND user_id = ?")
+          .bind(slotId, userId)
+          .run();
+      } catch {
+        // Safe to ignore; sweeper handles expired slots >5m
+      }
+    }
   }
 }
 
