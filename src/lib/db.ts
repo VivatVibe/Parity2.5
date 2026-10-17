@@ -246,6 +246,12 @@ export async function createJob(
   const metadataJson = JSON.stringify(input.metadata);
   const initialStatus = input.job_type === "RETAINER" ? "ACTIVE" : "RECEIVED";
 
+  // Retainer Rate Sync: sync total_quoted_amount with monthlyRate if 0 or omitted
+  let totalQuoted = input.total_quoted_amount || 0;
+  if (input.job_type === "RETAINER" && (!totalQuoted || totalQuoted === 0)) {
+    totalQuoted = (input.metadata as any).monthlyRate || 0;
+  }
+
   const res = await db
     .prepare(
       `INSERT INTO jobs (
@@ -260,7 +266,7 @@ export async function createJob(
       input.title,
       initialStatus,
       input.due_date || null,
-      input.total_quoted_amount || 0,
+      totalQuoted,
       metadataJson
     )
     .first<JobRecord>();
@@ -292,11 +298,90 @@ export async function getJobs(
   return results || [];
 }
 
+export interface JobFinancialSummary {
+  totalQuotedAmount: number;
+  totalPaid: number;
+  totalPartsCost: number;
+  balanceDue: number;
+  netProfit: number;
+  isPaidInFull: boolean;
+  currentCyclePaid?: boolean;
+  currentCyclePeriod?: string;
+}
+
+export async function getJobFinancialSummary(
+  db: D1Database,
+  userId: number,
+  job: JobRecord,
+  payments?: JobPaymentRecord[]
+): Promise<JobFinancialSummary> {
+  const jobPayments = payments ?? (await getJobPayments(db, userId, job.id));
+
+  let totalPaid = 0;
+  let loggedPartsCost = 0;
+  let hasSpecificPartsCost = false;
+
+  for (const p of jobPayments) {
+    totalPaid += Number(p.amount) || 0;
+    if (p.parts_cost && Number(p.parts_cost) > 0) {
+      loggedPartsCost += Number(p.parts_cost);
+      hasSpecificPartsCost = true;
+    }
+  }
+
+  // Fallback to metadata.partsCost for REPAIR if no payments logged parts_cost yet
+  let parsedMeta: any = {};
+  try {
+    parsedMeta = JSON.parse(job.metadata || "{}");
+  } catch (e) {}
+
+  let totalPartsCost = loggedPartsCost;
+  if (!hasSpecificPartsCost && job.job_type === "REPAIR" && parsedMeta.partsCost) {
+    totalPartsCost = Number(parsedMeta.partsCost) || 0;
+  }
+
+  const totalQuotedAmount = Number(job.total_quoted_amount) || 0;
+  const balanceDue = Math.max(0, totalQuotedAmount - totalPaid);
+  const netProfit = totalPaid - totalPartsCost;
+  const isPaidInFull = totalQuotedAmount > 0 && balanceDue === 0;
+
+  let currentCyclePaid: boolean | undefined = undefined;
+  let currentCyclePeriod: string | undefined = undefined;
+
+  if (job.job_type === "RETAINER") {
+    const now = new Date();
+    const currentYearMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    currentCyclePeriod = currentYearMonth;
+    currentCyclePaid = jobPayments.some(
+      (p) => p.payment_type === "RETAINER_CYCLE" && p.billing_period === currentYearMonth
+    );
+  }
+
+  return {
+    totalQuotedAmount,
+    totalPaid,
+    totalPartsCost,
+    balanceDue,
+    netProfit,
+    isPaidInFull,
+    currentCyclePaid,
+    currentCyclePeriod,
+  };
+}
+
 export async function getJobById(
   db: D1Database,
   userId: number,
   jobId: number
-): Promise<(JobRecord & { client?: ClientRecord; parsedMetadata?: any }) | null> {
+): Promise<
+  | (JobRecord & {
+      client?: ClientRecord;
+      parsedMetadata?: any;
+      payments: JobPaymentRecord[];
+      financialSummary: JobFinancialSummary;
+    })
+  | null
+> {
   const job = await db
     .prepare("SELECT * FROM jobs WHERE id = ? AND user_id = ?")
     .bind(jobId, userId)
@@ -310,11 +395,15 @@ export async function getJobById(
     .first<ClientRecord>();
 
   const parsedMetadata = parseJobMetadata(job.job_type, job.metadata);
+  const payments = await getJobPayments(db, userId, job.id);
+  const financialSummary = await getJobFinancialSummary(db, userId, job, payments);
 
   return {
     ...job,
     client: client || undefined,
     parsedMetadata,
+    payments,
+    financialSummary,
   };
 }
 
@@ -344,6 +433,16 @@ export async function addJobPayment(
     note?: string;
   }
 ): Promise<JobPaymentRecord> {
+  // Strict Tenant Isolation: verify job exists and belongs to this user
+  const job = await db
+    .prepare("SELECT id FROM jobs WHERE id = ? AND user_id = ?")
+    .bind(payment.jobId, userId)
+    .first<{ id: number }>();
+
+  if (!job) {
+    throw new Error(`Job ID ${payment.jobId} not found or does not belong to user ${userId}`);
+  }
+
   const res = await db
     .prepare(
       `INSERT INTO job_payments (

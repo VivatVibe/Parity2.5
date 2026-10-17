@@ -151,12 +151,17 @@ export default function NewJobPage() {
       };
     }
 
+    let quotedAmount = totalQuotedAmount === "" ? 0 : Number(totalQuotedAmount);
+    if (jobType === "RETAINER" && (!quotedAmount || quotedAmount === 0) && monthlyRate !== "") {
+      quotedAmount = Number(monthlyRate);
+    }
+
     const payload = {
       job_type: jobType,
       client_id: selectedClient.id,
       title,
       due_date: dueDate || undefined,
-      total_quoted_amount: totalQuotedAmount === "" ? 0 : Number(totalQuotedAmount),
+      total_quoted_amount: quotedAmount,
       metadata,
     };
 

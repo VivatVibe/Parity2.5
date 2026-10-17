@@ -187,9 +187,10 @@ export default function Home() {
             } catch (e) {}
 
             return (
-              <div
+              <Link
                 key={job.id}
-                className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm hover:border-slate-300 transition space-y-2"
+                href={`/jobs/${job.id}`}
+                className="block bg-white border border-slate-200 rounded-xl p-4 shadow-sm hover:border-blue-400 hover:shadow-md transition space-y-2 cursor-pointer"
               >
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -224,10 +225,11 @@ export default function Home() {
                   </div>
                 )}
 
-                <div className="text-[10px] text-slate-400 text-right">
-                  บันทึกเมื่อ: {new Date(job.created_at).toLocaleString("th-TH")}
+                <div className="flex justify-between items-center text-[10px] text-slate-400 pt-1">
+                  <span className="text-blue-600 font-semibold hover:underline">คลิกดูสมุดบัญชีและสลิป →</span>
+                  <span>บันทึกเมื่อ: {new Date(job.created_at).toLocaleString("th-TH")}</span>
                 </div>
-              </div>
+              </Link>
             );
           })}
         </section>
