@@ -36,6 +36,7 @@
 		"deploy": "vinext-cloudflare deploy",
 		"preview": "npm run build && npm run start --",
 		"cf-typegen": "cf workers types",
-		"test:ticket1": "tsx tests/verify_ticket1.ts"
+		"test:ticket1": "tsx tests/verify_ticket1.ts",
+		"test:ticket2": "tsx tests/verify_ticket2.ts"
 	}
 }

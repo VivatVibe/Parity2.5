@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 
 interface TracerState {
   authenticated: boolean;
@@ -132,21 +133,29 @@ export default function Home() {
           </div>
         </section>
 
-        {/* Action Button */}
-        <div className="flex justify-between items-center bg-blue-50 border border-blue-200 p-4 rounded-xl">
+        {/* Action Button & New Job Link */}
+        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center bg-blue-50 border border-blue-200 p-4 rounded-xl gap-3">
           <div>
-            <h2 className="font-bold text-sm text-blue-900">ทดสอบเพิ่มใบงาน (Tracer-Bullet)</h2>
+            <h2 className="font-bold text-sm text-blue-900">จัดการใบงาน (Jobs Management)</h2>
             <p className="text-xs text-blue-700 mt-0.5">
-              ทดสอบสร้าง Client $\rightarrow$ ออกรหัสงาน Atomic Counter $\rightarrow$ บันทึก JSON Metadata
+              เปิดใบงานใหม่พร้อมฟอร์มเลือกประเภทงาน (Repair / Project / Retainer)
             </p>
           </div>
-          <button
-            onClick={handleCreateTracerJob}
-            disabled={creating || loading}
-            className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold px-4 py-2.5 rounded-lg shadow disabled:opacity-50 transition"
-          >
-            {creating ? "กำลังบันทึก..." : "+ สร้าง 1 Dummy Job"}
-          </button>
+          <div className="flex items-center gap-2">
+            <Link
+              href="/jobs/new"
+              className="bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs px-4 py-2.5 rounded-lg shadow transition whitespace-nowrap"
+            >
+              + เปิดใบงานใหม่ (Intake Form)
+            </Link>
+            <button
+              onClick={handleCreateTracerJob}
+              disabled={creating || loading}
+              className="bg-white border border-blue-200 hover:bg-blue-100 text-blue-800 text-xs font-semibold px-3 py-2.5 rounded-lg transition disabled:opacity-50 whitespace-nowrap"
+            >
+              {creating ? "..." : "+ Dummy"}
+            </button>
+          </div>
         </div>
 
         {error && (
