@@ -2,6 +2,7 @@
  * Zero-Bloat Cloudflare R2 Storage Helper with Strict Image Validation
  * Native platform / Web Crypto / stdlib only. No heavy AWS SDK.
  */
+import { timingSafeEqual as cryptoTimingSafeEqual } from "node:crypto";
 
 interface StorageItem {
   data: Uint8Array;
@@ -284,14 +285,15 @@ export async function reconcileR2Storage(
   return { scannedCount, deletedOrphans, failedDeletions, truncated: false };
 }
 
-// Ponytail: Constant-time string comparison to prevent timing attacks
+// Ponytail: Standard library constant-time string comparison to prevent timing attacks
 export function timingSafeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.byteLength !== bufB.byteLength) {
+    cryptoTimingSafeEqual(bufA, bufA);
+    return false;
   }
-  return diff === 0;
+  return cryptoTimingSafeEqual(bufA, bufB);
 }
 
 /**

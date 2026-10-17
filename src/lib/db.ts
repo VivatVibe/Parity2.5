@@ -507,6 +507,27 @@ export async function addJobPayment(
 
   const idempotencyKey = payment.idempotencyKey ? payment.idempotencyKey.trim() : null;
 
+function isPaymentPayloadMatch(
+  existing: JobPaymentRecord,
+  payment: {
+    jobId: number;
+    amount: number;
+    partsCost?: number;
+    paymentType: string;
+    billingPeriod?: string;
+    note?: string;
+  }
+): boolean {
+  return (
+    existing.job_id === payment.jobId &&
+    Number(existing.amount) === Number(payment.amount) &&
+    Number(existing.parts_cost || 0) === Number(payment.partsCost || 0) &&
+    existing.payment_type === payment.paymentType &&
+    (existing.billing_period || null) === (payment.billingPeriod || null) &&
+    (existing.note || null) === (payment.note || null)
+  );
+}
+
   // DATA-03: If idempotency key provided, check for existing entry
   if (idempotencyKey) {
     const existing = await db
@@ -515,15 +536,7 @@ export async function addJobPayment(
       .first<JobPaymentRecord>();
 
     if (existing) {
-      const isMatch =
-        existing.job_id === payment.jobId &&
-        Number(existing.amount) === Number(payment.amount) &&
-        Number(existing.parts_cost || 0) === Number(payment.partsCost || 0) &&
-        existing.payment_type === payment.paymentType &&
-        (existing.billing_period || null) === (payment.billingPeriod || null) &&
-        (existing.note || null) === (payment.note || null);
-
-      if (isMatch) {
+      if (isPaymentPayloadMatch(existing, payment)) {
         return { ...existing, isIdempotentReplay: true };
       } else {
         throw new Error("IDEMPOTENCY_CONFLICT: Key reused with conflicting payment parameters");
@@ -561,15 +574,7 @@ export async function addJobPayment(
         .first<JobPaymentRecord>();
 
       if (existing) {
-        const isMatch =
-          existing.job_id === payment.jobId &&
-          Number(existing.amount) === Number(payment.amount) &&
-          Number(existing.parts_cost || 0) === Number(payment.partsCost || 0) &&
-          existing.payment_type === payment.paymentType &&
-          (existing.billing_period || null) === (payment.billingPeriod || null) &&
-          (existing.note || null) === (payment.note || null);
-
-        if (isMatch) {
+        if (isPaymentPayloadMatch(existing, payment)) {
           return { ...existing, isIdempotentReplay: true };
         } else {
           throw new Error("IDEMPOTENCY_CONFLICT: Key reused with conflicting payment parameters");
