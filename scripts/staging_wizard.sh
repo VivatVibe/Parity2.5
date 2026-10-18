@@ -186,13 +186,22 @@ banner "Cloudflare Staging Setup & Verification Wizard"
 
 # ── Stage 1: Cloudflare Authentication ────────────────────────────────────
 stage "Cloudflare Authentication"
-say "We will verify your Cloudflare account authentication with Wrangler."
+say "We will verify your Cloudflare authentication for Wrangler and Cloudflare CLI (cf)."
+
+step "1. Checking Wrangler authentication..."
 if npx wrangler whoami >/dev/null 2>&1; then
-  step "Already authenticated with Cloudflare via Wrangler!"
-  npx wrangler whoami
+  step "✓ Wrangler authenticated!"
 else
   step "Opening Cloudflare login via Wrangler CLI..."
   npx wrangler login
+fi
+
+step "2. Checking Cloudflare CLI (cf) authentication..."
+if npx cf auth whoami >/dev/null 2>&1; then
+  step "✓ Cloudflare CLI (cf) authenticated!"
+else
+  step "Opening Cloudflare login via cf CLI..."
+  npx cf auth login
 fi
 pause "Press Enter once authenticated with Cloudflare"
 
@@ -275,14 +284,13 @@ if confirm "Deploy worker to staging now?"; then
   export D1_DATABASE_ID="${D1_DATABASE_ID}"
   export R2_BUCKET_NAME="${R2_BUCKET_NAME:-parity-photos-staging}"
   
-  # Try native Vinext/Cloudflare deploy first; fallback to clean wrangler deploy
-  if npm run deploy; then
-    step "Successfully deployed with native Cloudflare CLI (cf)!"
-  else
-    warn "Native deploy returned non-zero, trying clean wrangler deploy..."
-    rm -rf .cloudflare/output
-    npx wrangler deploy --name parity-app-staging
+  if ! npx cf auth whoami >/dev/null 2>&1; then
+    step "Cloudflare CLI (cf) requires login..."
+    npx cf auth login
   fi
+
+  step "Executing deploy via Cloudflare CLI..."
+  npm run deploy
 fi
 
 say "Staging verification test options:"
