@@ -217,6 +217,36 @@ write_env R2_BUCKET_NAME "parity-photos-staging"
 # ── Stage 4: Run Migrations on Staging D1 ─────────────────────────────────
 stage "D1 Migrations Apply (0001 -> 0002)"
 say "Applying schema migrations to the staging D1 database."
+
+# Ensure wrangler.jsonc is configured with staging IDs
+cat <<EOF > wrangler.jsonc
+{
+  "\$schema": "node_modules/wrangler/config-schema.json",
+  "name": "parity-app-staging",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "parity-db-staging",
+      "database_id": "${D1_DATABASE_ID}",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "PHOTOS",
+      "bucket_name": "${R2_BUCKET_NAME:-parity-photos-staging}"
+    }
+  ],
+  "triggers": {
+    "crons": ["0 3 * * *"]
+  }
+}
+EOF
+say "Configured wrangler.jsonc with staging database and bucket."
+
 step "Executing: npx wrangler d1 migrations apply parity-db-staging --remote"
 if confirm "Apply migrations 0001 and 0002 to remote staging D1 now?"; then
   npx wrangler d1 migrations apply parity-db-staging --remote
