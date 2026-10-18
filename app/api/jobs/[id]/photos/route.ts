@@ -1,8 +1,14 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/src/lib/auth";
 import { env } from "cloudflare:workers";
-import { initDatabase, validatePhotoUploadQuota, createJobPhoto, getJobPhotos } from "@/src/lib/db";
-import { putPhoto, deletePhoto } from "@/src/lib/storage";
+import {
+  reservePhotoSlot,
+  activatePhotoSlot,
+  failPhotoSlot,
+  handlePhotoUploadActivationFailure,
+  getJobPhotos,
+} from "@/src/lib/db";
+import { putPhoto, deletePhoto, detectImageMimeType } from "@/src/lib/storage";
 
 export async function GET(
   request: Request,
@@ -10,7 +16,6 @@ export async function GET(
 ) {
   try {
     if (!env.DB) return NextResponse.json({ error: "D1 database missing" }, { status: 500 });
-    await initDatabase(env.DB);
 
     const session = await getCurrentUser(request);
     if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -34,7 +39,6 @@ export async function POST(
 ) {
   try {
     if (!env.DB) return NextResponse.json({ error: "D1 database missing" }, { status: 500 });
-    await initDatabase(env.DB);
 
     const session = await getCurrentUser(request);
     if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -62,29 +66,54 @@ export async function POST(
       );
     }
 
-    // 1. Validate quota and job ownership BEFORE touching R2 (No orphaned files!)
-    await validatePhotoUploadQuota(env.DB, session.userId, jobId);
-
-    const r2Key = `users/${session.userId}/jobs/${jobId}/${crypto.randomUUID()}.webp`;
     const arrayBuffer = await file.arrayBuffer();
     const buffer = new Uint8Array(arrayBuffer);
-    const contentType = file.type || "image/webp";
 
-    const r2Binding = (env as any).PHOTOS || (env as any).R2;
-
-    // 2. Write to R2
-    await putPhoto(r2Binding, r2Key, buffer, contentType);
-
-    // 3. Insert record into D1 (with rollback cleanup if insertion fails)
-    let photo;
-    try {
-      photo = await createJobPhoto(env.DB, session.userId, jobId, r2Key, caption);
-    } catch (dbErr) {
-      await deletePhoto(r2Binding, r2Key);
-      throw dbErr;
+    // SEC-03: Validate actual image bytes via magic bytes inspection
+    const imageInfo = detectImageMimeType(buffer);
+    if (!imageInfo) {
+      return NextResponse.json(
+        { error: "Invalid image format. Supported formats: WebP, JPEG, PNG." },
+        { status: 400 }
+      );
     }
 
-    return NextResponse.json({ success: true, photo });
+    const r2Binding = (env as any).PHOTOS || (env as any).R2;
+    if (process.env.NODE_ENV === "production" && !r2Binding) {
+      return NextResponse.json({ error: "Storage service unavailable" }, { status: 500 });
+    }
+
+    const r2Key = `users/${session.userId}/jobs/${jobId}/${crypto.randomUUID()}.${imageInfo.extension}`;
+
+    // DATA-01: Atomically reserve photo slot in D1 before streaming to R2
+    const reservedPhoto = await reservePhotoSlot(env.DB, session.userId, jobId, r2Key, caption);
+
+    // DATA-02: Stream to R2 with automatic cleanup on failure
+    try {
+      await putPhoto(r2Binding, r2Key, buffer, imageInfo.mimeType);
+    } catch (uploadErr) {
+      await failPhotoSlot(env.DB, session.userId, reservedPhoto.id);
+      throw uploadErr;
+    }
+
+    // Activate photo in D1 with generation fencing
+    let activePhoto;
+    try {
+      activePhoto = await activatePhotoSlot(env.DB, session.userId, reservedPhoto.id, r2Key);
+    } catch (actErr) {
+      await handlePhotoUploadActivationFailure(
+        env.DB,
+        r2Binding,
+        session.userId,
+        reservedPhoto.id,
+        r2Key,
+        actErr,
+        jobId
+      );
+      throw actErr;
+    }
+
+    return NextResponse.json({ success: true, photo: activePhoto });
   } catch (error: any) {
     return NextResponse.json({ error: error.message }, { status: 400 });
   }

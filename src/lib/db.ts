@@ -1,5 +1,6 @@
 import type { D1Database } from "@cloudflare/workers-types";
 import { type JobInput, type JobStatus, parseJobMetadata } from "../schemas/job";
+import { deletePhoto } from "./storage";
 
 export interface UserRecord {
   id: number;
@@ -44,20 +45,28 @@ export interface JobPaymentRecord {
   billing_period?: string;
   paid_at: string;
   note?: string;
+  idempotency_key?: string;
 }
 
 export interface JobPhotoRecord {
   id: number;
   job_id: number;
   user_id: number;
+  slot_number?: number | null;
   r2_key: string;
   caption?: string;
+  status: "RESERVED" | "ACTIVE" | "PENDING_DELETE" | "FAILED" | "CLEANING";
+  cleanup_attempts?: number;
+  last_cleanup_error?: string;
+  cleanup_worker_id?: string;
+  cleanup_generation?: number;
+  cleanup_lease_expires_at?: string;
   created_at: string;
 }
 
 const initializedDbs = new WeakSet<D1Database>();
 
-// 1. Database Schema Initialization (Idempotent Singleton)
+// 1. Database Schema Initialization (Used for local tests & dev migrations)
 export async function initDatabase(db: D1Database): Promise<void> {
   if (initializedDbs.has(db)) return;
   const schema = `
@@ -106,21 +115,31 @@ export async function initDatabase(db: D1Database): Promise<void> {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      amount REAL NOT NULL,
-      parts_cost REAL DEFAULT 0,
+      amount REAL NOT NULL CHECK(amount > 0),
+      parts_cost REAL DEFAULT 0 CHECK(parts_cost >= 0),
       payment_type TEXT NOT NULL,
       billing_period TEXT,
       paid_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      note TEXT
+      note TEXT,
+      idempotency_key TEXT,
+      UNIQUE(user_id, idempotency_key)
     );
 
     CREATE TABLE IF NOT EXISTS job_photos (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      slot_number INTEGER CHECK(slot_number BETWEEN 1 AND 5),
       r2_key TEXT NOT NULL,
       caption TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('RESERVED', 'ACTIVE', 'PENDING_DELETE', 'FAILED', 'CLEANING')),
+      cleanup_attempts INTEGER DEFAULT 0,
+      last_cleanup_error TEXT,
+      cleanup_worker_id TEXT,
+      cleanup_generation INTEGER DEFAULT 0,
+      cleanup_lease_expires_at DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(job_id, slot_number)
     );
 
     CREATE INDEX IF NOT EXISTS idx_clients_user ON clients(user_id);
@@ -131,7 +150,10 @@ export async function initDatabase(db: D1Database): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_jobs_user_type ON jobs(user_id, job_type);
     CREATE INDEX IF NOT EXISTS idx_payments_job ON job_payments(job_id, user_id);
     CREATE INDEX IF NOT EXISTS idx_payments_billing ON job_payments(user_id, billing_period);
+    CREATE INDEX IF NOT EXISTS idx_payments_idempotency ON job_payments(user_id, idempotency_key);
     CREATE INDEX IF NOT EXISTS idx_photos_job ON job_photos(job_id, user_id);
+    CREATE INDEX IF NOT EXISTS idx_photos_status ON job_photos(user_id, status);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_job_slot ON job_photos(job_id, slot_number);
   `;
 
   const statements = schema
@@ -369,13 +391,15 @@ export async function getJobFinancialSummary(
     }).format(new Date());
 
     currentCyclePeriod = currentYearMonth;
+    const monthlyRate = Number(parsedMeta?.monthlyRate) || totalQuotedAmount;
+
     const currentCyclePaidAmount = jobPayments
       .filter((p) => p.payment_type === "RETAINER_CYCLE" && p.billing_period === currentYearMonth)
       .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
 
-    currentCyclePaid = currentCyclePaidAmount >= totalQuotedAmount && totalQuotedAmount > 0;
-    balanceDue = Math.max(0, totalQuotedAmount - currentCyclePaidAmount);
-    isPaidInFull = totalQuotedAmount > 0 && balanceDue === 0;
+    currentCyclePaid = currentCyclePaidAmount >= monthlyRate && monthlyRate > 0;
+    balanceDue = Math.max(0, monthlyRate - currentCyclePaidAmount);
+    isPaidInFull = monthlyRate > 0 && balanceDue === 0;
   }
 
   return {
@@ -437,14 +461,23 @@ export async function updateJobStatus(
   jobId: number,
   status: JobStatus
 ): Promise<boolean> {
+  // Strict tenant verification: verify job exists and belongs to this user
+  const job = await db
+    .prepare("SELECT id FROM jobs WHERE id = ? AND user_id = ?")
+    .bind(jobId, userId)
+    .first<{ id: number }>();
+
+  if (!job) return false;
+
   const res = await db
     .prepare("UPDATE jobs SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?")
     .bind(status, jobId, userId)
     .run();
+
   return res.success;
 }
 
-// 6. Payment Operations (Financial Ledger)
+// 6. Payment Operations (Financial Ledger with DATA-03 Idempotency)
 export async function addJobPayment(
   db: D1Database,
   userId: number,
@@ -455,8 +488,9 @@ export async function addJobPayment(
     paymentType: "DEPOSIT" | "MILESTONE" | "FINAL" | "RETAINER_CYCLE";
     billingPeriod?: string;
     note?: string;
+    idempotencyKey?: string;
   }
-): Promise<JobPaymentRecord> {
+): Promise<JobPaymentRecord & { isIdempotentReplay?: boolean }> {
   // Strict Tenant Isolation: verify job exists and belongs to this user
   const job = await db
     .prepare("SELECT id FROM jobs WHERE id = ? AND user_id = ?")
@@ -467,25 +501,88 @@ export async function addJobPayment(
     throw new Error(`Job ID ${payment.jobId} not found or does not belong to user ${userId}`);
   }
 
-  const res = await db
-    .prepare(
-      `INSERT INTO job_payments (
-        job_id, user_id, amount, parts_cost, payment_type, billing_period, note
-      ) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`
-    )
-    .bind(
-      payment.jobId,
-      userId,
-      payment.amount,
-      payment.partsCost || 0,
-      payment.paymentType,
-      payment.billingPeriod || null,
-      payment.note || null
-    )
-    .first<JobPaymentRecord>();
+  if (payment.amount <= 0) {
+    throw new Error("Payment amount must be greater than 0");
+  }
 
-  if (!res) throw new Error("Failed to record payment");
-  return res;
+  const idempotencyKey = payment.idempotencyKey ? payment.idempotencyKey.trim() : null;
+
+function isPaymentPayloadMatch(
+  existing: JobPaymentRecord,
+  payment: {
+    jobId: number;
+    amount: number;
+    partsCost?: number;
+    paymentType: string;
+    billingPeriod?: string;
+    note?: string;
+  }
+): boolean {
+  return (
+    existing.job_id === payment.jobId &&
+    Number(existing.amount) === Number(payment.amount) &&
+    Number(existing.parts_cost || 0) === Number(payment.partsCost || 0) &&
+    existing.payment_type === payment.paymentType &&
+    (existing.billing_period || null) === (payment.billingPeriod || null) &&
+    (existing.note || null) === (payment.note || null)
+  );
+}
+
+  // DATA-03: If idempotency key provided, check for existing entry
+  if (idempotencyKey) {
+    const existing = await db
+      .prepare("SELECT * FROM job_payments WHERE user_id = ? AND idempotency_key = ?")
+      .bind(userId, idempotencyKey)
+      .first<JobPaymentRecord>();
+
+    if (existing) {
+      if (isPaymentPayloadMatch(existing, payment)) {
+        return { ...existing, isIdempotentReplay: true };
+      } else {
+        throw new Error("IDEMPOTENCY_CONFLICT: Key reused with conflicting payment parameters");
+      }
+    }
+  }
+
+  try {
+    const res = await db
+      .prepare(
+        `INSERT INTO job_payments (
+          job_id, user_id, amount, parts_cost, payment_type, billing_period, note, idempotency_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
+      )
+      .bind(
+        payment.jobId,
+        userId,
+        payment.amount,
+        payment.partsCost || 0,
+        payment.paymentType,
+        payment.billingPeriod || null,
+        payment.note || null,
+        idempotencyKey
+      )
+      .first<JobPaymentRecord>();
+
+    if (!res) throw new Error("Failed to record payment");
+    return res;
+  } catch (err: any) {
+    // If unique constraint collision triggered under race conditions:
+    if (idempotencyKey && err.message && (err.message.includes("UNIQUE") || err.message.includes("constraint"))) {
+      const existing = await db
+        .prepare("SELECT * FROM job_payments WHERE user_id = ? AND idempotency_key = ?")
+        .bind(userId, idempotencyKey)
+        .first<JobPaymentRecord>();
+
+      if (existing) {
+        if (isPaymentPayloadMatch(existing, payment)) {
+          return { ...existing, isIdempotentReplay: true };
+        } else {
+          throw new Error("IDEMPOTENCY_CONFLICT: Key reused with conflicting payment parameters");
+        }
+      }
+    }
+    throw err;
+  }
 }
 
 export async function getJobPayments(
@@ -500,45 +597,40 @@ export async function getJobPayments(
   return results || [];
 }
 
-// 7. Photo Operations (R2 Storage & 5-Photo Quota)
+// 7. Photo Operations (Atomic Reservation, Quota & Durable Lifecycle)
 export async function getJobPhotos(
   db: D1Database,
   userId: number,
   jobId: number
 ): Promise<JobPhotoRecord[]> {
   const { results } = await db
-    .prepare("SELECT * FROM job_photos WHERE job_id = ? AND user_id = ? ORDER BY id ASC")
+    .prepare(
+      "SELECT * FROM job_photos WHERE job_id = ? AND user_id = ? AND status = 'ACTIVE' ORDER BY slot_number ASC, id ASC"
+    )
     .bind(jobId, userId)
     .all<JobPhotoRecord>();
   return results || [];
 }
 
-export async function getJobPhotosForJob(
-  db: D1Database,
-  jobId: number
-): Promise<JobPhotoRecord[]> {
-  const { results } = await db
-    .prepare("SELECT * FROM job_photos WHERE job_id = ? ORDER BY id ASC")
-    .bind(jobId)
-    .all<JobPhotoRecord>();
-  return results || [];
-}
-
+/**
+ * SEC-02: Strictly require tenant ownership for photo lookup.
+ * Unsafe optional userId is removed; userId is strictly required.
+ */
 export async function getJobPhotoById(
   db: D1Database,
   jobId: number,
   photoId: number,
-  userId?: number
+  userId: number
 ): Promise<JobPhotoRecord | null> {
-  let query = "SELECT * FROM job_photos WHERE id = ? AND job_id = ?";
-  const params: any[] = [photoId, jobId];
-
-  if (userId !== undefined) {
-    query += " AND user_id = ?";
-    params.push(userId);
+  if (typeof userId !== "number" || isNaN(userId) || userId <= 0) {
+    throw new Error("Tenant userId is strictly required for photo lookup");
   }
 
-  const photo = await db.prepare(query).bind(...params).first<JobPhotoRecord>();
+  const photo = await db
+    .prepare("SELECT * FROM job_photos WHERE id = ? AND job_id = ? AND user_id = ?")
+    .bind(photoId, jobId, userId)
+    .first<JobPhotoRecord>();
+
   return photo || null;
 }
 
@@ -557,7 +649,10 @@ export async function validatePhotoUploadQuota(
   }
 
   const countResult = await db
-    .prepare("SELECT COUNT(*) as count FROM job_photos WHERE job_id = ? AND user_id = ?")
+    .prepare(
+      `SELECT COUNT(*) as count FROM job_photos 
+       WHERE job_id = ? AND user_id = ? AND status IN ('ACTIVE', 'RESERVED')`
+    )
     .bind(jobId, userId)
     .first<{ count: number }>();
 
@@ -567,6 +662,358 @@ export async function validatePhotoUploadQuota(
   }
 }
 
+/**
+ * DATA-01 & DATA-02: Atomically reserve a photo slot (1..5) in D1 before streaming to R2.
+ */
+export async function reservePhotoSlot(
+  db: D1Database,
+  userId: number,
+  jobId: number,
+  r2Key: string,
+  caption?: string
+): Promise<JobPhotoRecord> {
+  const job = await db
+    .prepare("SELECT id FROM jobs WHERE id = ? AND user_id = ?")
+    .bind(jobId, userId)
+    .first<{ id: number }>();
+
+  if (!job) {
+    throw new Error(`Job ID ${jobId} not found or does not belong to user ${userId}`);
+  }
+
+  // Fetch current occupied slots
+  const existingRows = await db
+    .prepare(
+      `SELECT id, slot_number, status, created_at FROM job_photos 
+       WHERE job_id = ? AND user_id = ? AND status IN ('ACTIVE', 'RESERVED', 'CLEANING')`
+    )
+    .bind(jobId, userId)
+    .all<{ id: number; slot_number: number | null; status: string; created_at: string }>();
+
+  const totalCount = existingRows.results?.length ?? 0;
+  if (totalCount >= 5) {
+    throw new Error("อัปโหลดรูปภาพได้สูงสุด 5 รูปต่อใบงาน (Max 5 photos reached)");
+  }
+
+  const occupiedSlots = new Set<number>();
+  for (const row of existingRows.results || []) {
+    if (row.slot_number !== null && row.slot_number !== undefined) {
+      occupiedSlots.add(row.slot_number);
+    }
+  }
+
+  if (occupiedSlots.size >= 5) {
+    throw new Error("อัปโหลดรูปภาพได้สูงสุด 5 รูปต่อใบงาน (Max 5 photos reached)");
+  }
+
+  // Find lowest free slot (1..5)
+  let chosenSlot = -1;
+  for (let s = 1; s <= 5; s++) {
+    if (!occupiedSlots.has(s)) {
+      chosenSlot = s;
+      break;
+    }
+  }
+
+  if (chosenSlot === -1) {
+    throw new Error("อัปโหลดรูปภาพได้สูงสุด 5 รูปต่อใบงาน (Max 5 photos reached)");
+  }
+
+  try {
+    const res = await db
+      .prepare(
+        `INSERT INTO job_photos (job_id, user_id, slot_number, r2_key, caption, status)
+         VALUES (?, ?, ?, ?, ?, 'RESERVED') RETURNING *`
+      )
+      .bind(jobId, userId, chosenSlot, r2Key, caption || null)
+      .first<JobPhotoRecord>();
+
+    if (!res) throw new Error("Failed to reserve photo slot");
+    return res;
+  } catch (err: any) {
+    // Handle concurrent contender race condition
+    if (err.message && (err.message.includes("UNIQUE") || err.message.includes("constraint"))) {
+      const retrySlots = await db
+        .prepare(
+          `SELECT slot_number FROM job_photos 
+           WHERE job_id = ? AND user_id = ? AND status IN ('ACTIVE', 'RESERVED', 'CLEANING')`
+        )
+        .bind(jobId, userId)
+        .all<{ slot_number: number | null }>();
+      const currentOccupied = new Set(
+        (retrySlots.results || [])
+          .map((r) => r.slot_number)
+          .filter((s): s is number => s !== null && s !== undefined)
+      );
+      if (currentOccupied.size >= 5 || (retrySlots.results || []).length >= 5) {
+        throw new Error("อัปโหลดรูปภาพได้สูงสุด 5 รูปต่อใบงาน (Max 5 photos reached)");
+      }
+      for (let s = 1; s <= 5; s++) {
+        if (!currentOccupied.has(s)) {
+          const resRetry = await db
+            .prepare(
+              `INSERT INTO job_photos (job_id, user_id, slot_number, r2_key, caption, status)
+               VALUES (?, ?, ?, ?, ?, 'RESERVED') RETURNING *`
+            )
+            .bind(jobId, userId, s, r2Key, caption || null)
+            .first<JobPhotoRecord>();
+          if (resRetry) return resRetry;
+        }
+      }
+      throw new Error("อัปโหลดรูปภาพได้สูงสุด 5 รูปต่อใบงาน (Max 5 photos reached)");
+    }
+    throw err;
+  }
+}
+
+export async function activatePhotoSlot(
+  db: D1Database,
+  userId: number,
+  photoId: number,
+  r2Key?: string
+): Promise<JobPhotoRecord> {
+  let query = `
+    UPDATE job_photos 
+    SET status = 'ACTIVE' 
+    WHERE id = ? AND user_id = ? AND status = 'RESERVED' 
+      AND created_at >= datetime('now', '-5 minutes')
+  `;
+  const params: any[] = [photoId, userId];
+
+  if (r2Key) {
+    query = `
+      UPDATE job_photos 
+      SET status = 'ACTIVE' 
+      WHERE id = ? AND user_id = ? AND r2_key = ? AND status = 'RESERVED' 
+        AND created_at >= datetime('now', '-5 minutes')
+    `;
+    params.push(r2Key);
+  }
+
+  query += " RETURNING *";
+
+  const res = await db.prepare(query).bind(...params).first<JobPhotoRecord>();
+
+  if (!res) {
+    throw new Error(
+      "Failed to activate photo record: reservation expired (>5m), already cleaned up, or invalid key"
+    );
+  }
+  return res;
+}
+
+export async function failPhotoSlot(
+  db: D1Database,
+  userId: number,
+  photoId: number
+): Promise<void> {
+  await db
+    .prepare("DELETE FROM job_photos WHERE id = ? AND user_id = ? AND status = 'RESERVED'")
+    .bind(photoId, userId)
+    .run();
+}
+
+export async function markPhotoForDeletion(
+  db: D1Database,
+  userId: number,
+  jobId: number,
+  photoId: number
+): Promise<JobPhotoRecord> {
+  // P0-02 / R7-A1: Unified deletion ownership protocol with atomic generation fencing.
+  // Atomically increment cleanup_generation to fence out prior workers or in-flight leases.
+  // Only allow transition from non-CLEANING states or from expired CLEANING leases.
+  const photo = await db
+    .prepare(
+      `UPDATE job_photos 
+       SET status = 'PENDING_DELETE', 
+           slot_number = NULL,
+           cleanup_generation = COALESCE(cleanup_generation, 0) + 1
+       WHERE id = ? AND job_id = ? AND user_id = ? 
+         AND (
+           status != 'CLEANING' 
+           OR cleanup_lease_expires_at IS NULL 
+           OR cleanup_lease_expires_at < datetime('now')
+         )
+       RETURNING *`
+    )
+    .bind(photoId, jobId, userId)
+    .first<JobPhotoRecord>();
+
+  if (!photo) {
+    // Check if photo exists to diagnose active background lease contention vs non-existent photo
+    const existing = await db
+      .prepare(
+        "SELECT id, status, cleanup_lease_expires_at FROM job_photos WHERE id = ? AND job_id = ? AND user_id = ?"
+      )
+      .bind(photoId, jobId, userId)
+      .first<{ id: number; status: string; cleanup_lease_expires_at: string | null }>();
+
+    if (!existing) {
+      throw new Error(`Photo ID ${photoId} not found or does not belong to user ${userId}`);
+    }
+    // Photo exists but is locked by an active background cleanup lease
+    throw new Error(
+      `Photo ID ${photoId} is currently locked by active background cleanup processing`
+    );
+  }
+  return photo;
+}
+
+export async function claimPhotoForDeletion(
+  db: D1Database,
+  userId: number,
+  jobId: number,
+  photoId: number,
+  workerId: string,
+  leaseMinutes = 2
+): Promise<JobPhotoRecord> {
+  // R8-A2 / R9-01: Exclusive deletion ownership protocol.
+  // Distributed safety invariant:
+  // - At-most-one valid D1 lease owner: D1 atomic CAS guarantees at-most-one worker holds an active lease and can finalize.
+  // - Idempotent external R2 deletion: Keys are immutable UUIDs; if a lease expires while an R2 delete is in flight,
+  //   subsequent background sweeper DELETE is idempotent.
+  // Fails if the row is already locked by another cleaner holding an unexpired lease.
+  const photo = await db
+    .prepare(
+      `UPDATE job_photos 
+       SET status = 'CLEANING', 
+           cleanup_worker_id = ?,
+           cleanup_generation = COALESCE(cleanup_generation, 0) + 1,
+           cleanup_lease_expires_at = datetime('now', '+' || ? || ' minutes'),
+           slot_number = NULL
+       WHERE id = ? AND job_id = ? AND user_id = ? 
+         AND (
+           status != 'CLEANING' 
+           OR cleanup_lease_expires_at IS NULL 
+           OR cleanup_lease_expires_at < datetime('now')
+         )
+       RETURNING *`
+    )
+    .bind(workerId, leaseMinutes, photoId, jobId, userId)
+    .first<JobPhotoRecord>();
+
+  if (!photo) {
+    const existing = await db
+      .prepare(
+        "SELECT id, status, cleanup_lease_expires_at FROM job_photos WHERE id = ? AND job_id = ? AND user_id = ?"
+      )
+      .bind(photoId, jobId, userId)
+      .first<{ id: number; status: string; cleanup_lease_expires_at: string | null }>();
+
+    if (!existing) {
+      throw new Error(`Photo ID ${photoId} not found or does not belong to user ${userId}`);
+    }
+    throw new Error(
+      `Photo ID ${photoId} is currently locked by active background cleanup processing`
+    );
+  }
+  return photo;
+}
+
+export async function markPhotoSlotForCleanupRetry(
+  db: D1Database,
+  userId: number,
+  photoId: number,
+  lastError: string,
+  r2Key?: string,
+  jobId?: number
+): Promise<void> {
+  // R8-A3 / R9-02 / R10-01: Lease-aware durable failure recording.
+  // Only transitions rows that are NOT actively CLEANING with a valid lease held by another worker.
+  // This prevents upload cleanup from overwriting a sweeper's active ownership.
+  const res = await db
+    .prepare(
+      `UPDATE job_photos 
+       SET status = 'PENDING_DELETE', 
+           slot_number = NULL, 
+           cleanup_attempts = COALESCE(cleanup_attempts, 0) + 1,
+           last_cleanup_error = ?
+       WHERE id = ? AND user_id = ?
+         AND (
+           status != 'CLEANING'
+           OR cleanup_lease_expires_at IS NULL
+           OR cleanup_lease_expires_at < datetime('now')
+         )`
+    )
+    .bind(lastError, photoId, userId)
+    .run();
+
+  const changes = (res as any)?.changes ?? (res as any)?.meta?.changes ?? 0;
+  if (changes === 0 && r2Key) {
+    // Distinguish: row actively owned vs row missing
+    const existing = await db
+      .prepare("SELECT id, status FROM job_photos WHERE id = ? AND user_id = ?")
+      .bind(photoId, userId)
+      .first<{ id: number; status: string }>();
+
+    if (existing) {
+      // Row exists but is actively CLEANING with a valid lease — do not overwrite.
+      // The current owner will handle cleanup; no action needed.
+      return;
+    }
+
+    // R9-02 / R10-04: Row is truly missing (purged by sweeper). Insert tombstone for durable retry.
+    // Wrapped in try/catch: if parent job is missing (FK constraint) or concurrent tombstone creation,
+    // R2 reconciler serves as the last-resort cleanup path for orphaned R2 objects.
+    const derivedJobId = jobId || Number(r2Key.match(/jobs\/(\d+)\//)?.[1]) || null;
+    if (derivedJobId) {
+      try {
+        await db
+          .prepare(
+            `INSERT INTO job_photos (job_id, user_id, slot_number, r2_key, status, cleanup_attempts, last_cleanup_error)
+             VALUES (?, ?, NULL, ?, 'PENDING_DELETE', 1, ?)`
+          )
+          .bind(derivedJobId, userId, r2Key, `Orphan recovery: ${lastError}`)
+          .run();
+      } catch {
+        // ponytail: tombstone INSERT failed (FK violation, duplicate key, etc.).
+        // R2 reconciler will catch the orphaned R2 object after safetyGracePeriodMs expires.
+      }
+    }
+    // ponytail: if derivedJobId is null or tombstone INSERT failed, the R2 object becomes an orphan
+    // that the periodic R2 reconciler (reconcileR2Storage) will purge after the 60-minute grace period.
+  }
+}
+
+export async function finalizePhotoDeletion(
+  db: D1Database,
+  userId: number,
+  photoId: number,
+  workerId?: string,
+  expectedGeneration?: number
+): Promise<boolean> {
+  // R8-A1 & R8-A2: Conditional finalization fencing under active exclusive lease.
+  // Strictly verifies ownership, generation token, and active lease validity.
+  let query: string;
+  const params: any[] = [photoId, userId];
+
+  if (workerId) {
+    query = `DELETE FROM job_photos 
+             WHERE id = ? AND user_id = ? 
+               AND status = 'CLEANING' 
+               AND cleanup_worker_id = ? 
+               AND cleanup_lease_expires_at IS NOT NULL 
+               AND cleanup_lease_expires_at >= datetime('now')`;
+    params.push(workerId);
+    if (expectedGeneration !== undefined) {
+      query += " AND (cleanup_generation IS ? OR cleanup_generation = ?)";
+      params.push(expectedGeneration, expectedGeneration);
+    }
+  } else {
+    query = `DELETE FROM job_photos 
+             WHERE id = ? AND user_id = ? 
+               AND status = 'PENDING_DELETE'`;
+    if (expectedGeneration !== undefined) {
+      query += " AND (cleanup_generation IS ? OR cleanup_generation = ?)";
+      params.push(expectedGeneration, expectedGeneration);
+    }
+  }
+
+  const res = await db.prepare(query).bind(...params).run();
+  const changes = (res as any)?.changes ?? (res as any)?.meta?.changes ?? 0;
+  return changes > 0;
+}
+
 export async function createJobPhoto(
   db: D1Database,
   userId: number,
@@ -574,18 +1021,8 @@ export async function createJobPhoto(
   r2Key: string,
   caption?: string
 ): Promise<JobPhotoRecord> {
-  // Strict Tenant Isolation & Quota Check
-  await validatePhotoUploadQuota(db, userId, jobId);
-
-  const res = await db
-    .prepare(
-      "INSERT INTO job_photos (job_id, user_id, r2_key, caption) VALUES (?, ?, ?, ?) RETURNING *"
-    )
-    .bind(jobId, userId, r2Key, caption || null)
-    .first<JobPhotoRecord>();
-
-  if (!res) throw new Error("Failed to insert photo record");
-  return res;
+  const reserved = await reservePhotoSlot(db, userId, jobId, r2Key, caption);
+  return await activatePhotoSlot(db, userId, reserved.id);
 }
 
 export async function deleteJobPhoto(
@@ -594,22 +1031,309 @@ export async function deleteJobPhoto(
   jobId: number,
   photoId: number
 ): Promise<JobPhotoRecord> {
-  // Find photo and verify tenant ownership
-  const photo = await db
-    .prepare("SELECT * FROM job_photos WHERE id = ? AND job_id = ? AND user_id = ?")
-    .bind(photoId, jobId, userId)
-    .first<JobPhotoRecord>();
+  const workerId = `delete-worker-${userId}-${Date.now()}`;
+  const claimed = await claimPhotoForDeletion(db, userId, jobId, photoId, workerId);
+  await finalizePhotoDeletion(db, userId, photoId, workerId, claimed.cleanup_generation);
+  return claimed;
+}
 
-  if (!photo) {
-    throw new Error(`Photo ID ${photoId} not found or does not belong to user ${userId}`);
+export async function handlePhotoDeletionRequest(
+  db: D1Database,
+  r2: any,
+  userId: number,
+  jobId: number,
+  photoId: number,
+  customWorkerId?: string
+): Promise<{ status: number; body: { success?: boolean; deletedPhotoId?: number; error?: string } }> {
+  const workerId =
+    customWorkerId ||
+    `http-del-${userId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+  let claimedPhoto: JobPhotoRecord;
+  try {
+    claimedPhoto = await claimPhotoForDeletion(db, userId, jobId, photoId, workerId);
+  } catch (claimErr: any) {
+    const isConflict = claimErr?.message?.includes("currently locked by active background cleanup");
+    const isNotFound = claimErr?.message?.includes("not found");
+    return {
+      status: isConflict ? 409 : isNotFound ? 404 : 400,
+      body: { error: claimErr?.message || "Failed to claim photo for deletion" },
+    };
   }
 
-  await db
-    .prepare("DELETE FROM job_photos WHERE id = ? AND user_id = ?")
-    .bind(photoId, userId)
-    .run();
+  // R9-01 Invariant: At-most-one valid D1 lease owner + idempotent external R2 deletion on immutable UUID keys.
+  // D1 CAS generation fencing guarantees at-most-one worker can successfully finalize row deletion.
+  // In the event of lease expiry during in-flight external R2 deletion, concurrent DELETEs to the same immutable UUID key are idempotent.
+  try {
+    await deletePhoto(r2, claimedPhoto.r2_key);
+  } catch (r2Err: any) {
+    // R9-03 / R10-03: Record diagnostic metadata fenced by generation, status, and active lease validity.
+    // A stale worker whose lease expired cannot overwrite a new owner's metadata.
+    await db
+      .prepare(
+        `UPDATE job_photos 
+         SET cleanup_attempts = COALESCE(cleanup_attempts, 0) + 1,
+             last_cleanup_error = ?
+         WHERE id = ? AND user_id = ? 
+           AND status = 'CLEANING'
+           AND cleanup_worker_id = ?
+           AND cleanup_generation = ?
+           AND cleanup_lease_expires_at IS NOT NULL
+           AND cleanup_lease_expires_at >= datetime('now')`
+      )
+      .bind(r2Err?.message || "R2 delete failed", photoId, userId, workerId, claimedPhoto.cleanup_generation)
+      .run();
 
-  return photo;
+    return {
+      status: 502,
+      body: { error: `Storage deletion failed: ${r2Err?.message || "Unknown R2 error"}` },
+    };
+  }
+
+  // R8-A1: Finalize deletion in D1 verifying active lease and generation ownership
+  const finalized = await finalizePhotoDeletion(
+    db,
+    userId,
+    photoId,
+    workerId,
+    claimedPhoto.cleanup_generation
+  );
+
+  if (!finalized) {
+    // R8-A1: Never falsely return success if D1 finalization failed or lease expired
+    return {
+      status: 409,
+      body: { error: "Photo deletion lease expired or was preempted before finalization" },
+    };
+  }
+
+  return {
+    status: 200,
+    body: { success: true, deletedPhotoId: photoId },
+  };
+}
+
+export async function handlePhotoUploadActivationFailure(
+  db: D1Database,
+  r2: any,
+  userId: number,
+  slotId: number,
+  r2Key: string,
+  activationError: any,
+  jobId?: number
+): Promise<void> {
+  // R8-A3 / R9-02: Durable cleanup on activation failure.
+  // If R2 deletion succeeds, purge the reservation immediately via failPhotoSlot.
+  // If R2 deletion fails, preserve or insert row as PENDING_DELETE with diagnostic error for sweeper retry.
+  let r2Deleted = false;
+  try {
+    await deletePhoto(r2, r2Key);
+    r2Deleted = true;
+  } catch (r2Err: any) {
+    await markPhotoSlotForCleanupRetry(
+      db,
+      userId,
+      slotId,
+      r2Err?.message || "R2 cleanup failed",
+      r2Key,
+      jobId
+    );
+  }
+  if (r2Deleted) {
+    try {
+      await failPhotoSlot(db, userId, slotId);
+    } catch {
+      // R10-02: failPhotoSlot only deletes RESERVED rows. If the row changed status
+      // (e.g. transient D1 error, or sweeper already claimed it), set PENDING_DELETE
+      // which the background sweeper already handles. R2 is already deleted, so
+      // sweeper's idempotent R2 delete is safe — it just purges the D1 metadata.
+      try {
+        await db
+          .prepare(
+            `UPDATE job_photos SET status = 'PENDING_DELETE', slot_number = NULL 
+             WHERE id = ? AND user_id = ?
+               AND (
+                 status != 'CLEANING'
+                 OR cleanup_lease_expires_at IS NULL
+                 OR cleanup_lease_expires_at < datetime('now')
+               )`
+          )
+          .bind(slotId, userId)
+          .run();
+      } catch {
+        // ponytail: D1 is unreachable. Row stays as RESERVED and sweeper will
+        // pick it up after the 5-minute reservation expiry.
+      }
+    }
+  }
+}
+
+export async function renewPhotoCleanupLease(
+  db: D1Database,
+  photoId: number,
+  workerId: string,
+  generation: number,
+  extensionMinutes = 2
+): Promise<boolean> {
+  // P0-02: Enforce lease ownership, exact generation, AND that lease is still unexpired
+  const res = await db
+    .prepare(
+      `UPDATE job_photos 
+       SET cleanup_lease_expires_at = datetime('now', '+' || ? || ' minutes')
+       WHERE id = ? 
+         AND status = 'CLEANING' 
+         AND cleanup_worker_id = ? 
+         AND cleanup_generation = ?
+         AND cleanup_lease_expires_at IS NOT NULL
+         AND cleanup_lease_expires_at >= datetime('now')`
+    )
+    .bind(extensionMinutes, photoId, workerId, generation)
+    .run();
+  const changes = (res as any)?.changes ?? (res as any)?.meta?.changes ?? 0;
+  return changes > 0;
+}
+
+export async function cleanupOrphanedPhotos(
+  db: D1Database,
+  r2: any,
+  userId?: number,
+  workerId?: string
+): Promise<{ cleanedCount: number; failedCount: number; skippedCount: number }> {
+  const currentWorkerId =
+    workerId ||
+    (typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `worker-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+
+  // 1. Select candidate records for cleanup:
+  // - Explicitly marked PENDING_DELETE
+  // - Expired RESERVED (> 5m old)
+  // - Stale CLEANING leases where cleanup_lease_expires_at is strictly in the PAST
+  let query = `
+    SELECT id, user_id, r2_key, status, created_at, cleanup_attempts, cleanup_generation, cleanup_lease_expires_at 
+    FROM job_photos 
+    WHERE (
+      status = 'PENDING_DELETE' 
+      OR (status = 'RESERVED' AND created_at < datetime('now', '-5 minutes'))
+      OR (status = 'CLEANING' AND cleanup_lease_expires_at IS NOT NULL AND cleanup_lease_expires_at < datetime('now'))
+    )
+  `;
+  const params: any[] = [];
+  if (userId !== undefined) {
+    query += " AND user_id = ?";
+    params.push(userId);
+  }
+
+  const { results } = await db.prepare(query).bind(...params).all<{
+    id: number;
+    user_id: number;
+    r2_key: string;
+    status: string;
+    created_at: string;
+    cleanup_attempts: number;
+    cleanup_generation: number;
+    cleanup_lease_expires_at: string | null;
+  }>();
+
+  let cleanedCount = 0;
+  let failedCount = 0;
+  let skippedCount = 0;
+
+  for (const row of results || []) {
+    const expectedGen = row.cleanup_generation ?? 0;
+
+    // 2. P0-02 Atomic CAS state transition to 'CLEANING':
+    // - Enforce expected cleanup_generation in predicate
+    // - Atomically increment generation in SQL: COALESCE(cleanup_generation, 0) + 1
+    // - Retrieve the new generation directly via RETURNING
+    const claimRes = await db
+      .prepare(
+        `UPDATE job_photos 
+         SET status = 'CLEANING', 
+             cleanup_worker_id = ?, 
+             cleanup_generation = COALESCE(cleanup_generation, 0) + 1,
+             cleanup_lease_expires_at = datetime('now', '+2 minutes'),
+             slot_number = NULL
+         WHERE id = ? 
+           AND (cleanup_generation IS ? OR cleanup_generation = ?)
+           AND (
+             status = 'PENDING_DELETE' 
+             OR (status = 'RESERVED' AND created_at < datetime('now', '-5 minutes'))
+             OR (status = 'CLEANING' AND cleanup_lease_expires_at IS NOT NULL AND cleanup_lease_expires_at < datetime('now'))
+           )
+         RETURNING cleanup_generation`
+      )
+      .bind(currentWorkerId, row.id, row.cleanup_generation ?? null, expectedGen)
+      .first<{ cleanup_generation: number }>();
+
+    if (!claimRes || claimRes.cleanup_generation === undefined || claimRes.cleanup_generation === null) {
+      // Row was claimed concurrently, generation diverged, or lease was renewed. Skip!
+      skippedCount++;
+      continue;
+    }
+
+    const targetGen = claimRes.cleanup_generation;
+
+    // 3. Perform external R2 deletion under verified exclusive lease
+    let r2Success = false;
+    let r2Error = "";
+    try {
+      await deletePhoto(r2, row.r2_key);
+      r2Success = true;
+    } catch (err: any) {
+      r2Success = false;
+      r2Error = err?.message || "R2 deletion failed";
+    }
+
+    if (r2Success) {
+      // 4a. Conditional D1 row deletion: verify ownership, generation, AND active lease validity before purging.
+      // Note: D1 fencing does not physically cancel or abort in-flight network requests to R2;
+      // rather, it fences the D1 transaction boundary so that a delayed or stale worker cannot finalize or commit
+      // deletions if its lease expired or was taken over by a newer worker.
+      const delRes = await db
+        .prepare(
+          `DELETE FROM job_photos 
+           WHERE id = ? 
+             AND status = 'CLEANING' 
+             AND cleanup_worker_id = ?
+             AND cleanup_generation = ?
+             AND cleanup_lease_expires_at IS NOT NULL
+             AND cleanup_lease_expires_at >= datetime('now')`
+        )
+        .bind(row.id, currentWorkerId, targetGen)
+        .run();
+
+      const delAffected = (delRes as any)?.changes ?? (delRes as any)?.meta?.changes ?? 0;
+      if (delAffected > 0) {
+        cleanedCount++;
+      } else {
+        // Lease was stolen by a newer worker or expired while R2 delete was running.
+        skippedCount++;
+      }
+    } else {
+      // 4b. Revert to PENDING_DELETE with diagnostic error, fenced by ownership, generation, and active lease.
+      failedCount++;
+      await db
+        .prepare(
+          `UPDATE job_photos 
+           SET status = 'PENDING_DELETE', 
+               cleanup_attempts = COALESCE(cleanup_attempts, 0) + 1, 
+               last_cleanup_error = ?,
+               cleanup_worker_id = NULL,
+               cleanup_lease_expires_at = NULL 
+           WHERE id = ? 
+             AND status = 'CLEANING' 
+             AND cleanup_worker_id = ?
+             AND cleanup_generation = ?
+             AND cleanup_lease_expires_at IS NOT NULL
+             AND cleanup_lease_expires_at >= datetime('now')`
+        )
+        .bind(r2Error, row.id, currentWorkerId, targetGen)
+        .run();
+    }
+  }
+
+  return { cleanedCount, failedCount, skippedCount };
 }
 
 // 8. Mission Control Dashboard Aggregation (Zero N+1 Queries)
@@ -676,23 +1400,25 @@ export async function getDashboardData(
     day: "2-digit",
   }).format(new Date());
 
-  // 1. Aggregated query for monthly revenue and parts cost
+  // FIN-02: Timezone aligned with Asia/Bangkok (+7 hours) in SQLite
+  // Query 1: Monthly KPI aggregates
   const kpiRow = await db
     .prepare(
       `SELECT 
         COALESCE(SUM(amount), 0) as monthly_revenue,
         COALESCE(SUM(parts_cost), 0) as monthly_parts_cost
        FROM job_payments 
-       WHERE user_id = ? AND strftime('%Y-%m', paid_at) = ?`
+       WHERE user_id = ? AND strftime('%Y-%m', datetime(paid_at, '+7 hours')) = ?`
     )
     .bind(userId, currentBangkokMonth)
     .first<{ monthly_revenue: number; monthly_parts_cost: number }>();
 
   const monthlyRevenue = kpiRow?.monthly_revenue ?? 0;
   const monthlyPartsCost = kpiRow?.monthly_parts_cost ?? 0;
+  // Direct Contribution Margin before overhead
   const monthlyProfit = monthlyRevenue - monthlyPartsCost;
 
-  // 2. Aggregated query for all jobs with clients and payment sums (Zero N+1)
+  // Query 2: All jobs joined with clients and payment sums in single query (Zero N+1)
   let jobsQuery = `
     SELECT 
       j.id,
@@ -828,7 +1554,7 @@ export async function getDashboardData(
   // Sort Retainers: Unpaid on top, then by billingCycleDay
   retainers.sort((a, b) => {
     if (a.currentCyclePaid !== b.currentCyclePaid) {
-      return a.currentCyclePaid ? 1 : -1; // unpaid first
+      return a.currentCyclePaid ? 1 : -1;
     }
     const dayA = a.parsedMetadata?.billingCycleDay || 1;
     const dayB = b.parsedMetadata?.billingCycleDay || 1;

@@ -1,13 +1,12 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/src/lib/auth";
 import { env } from "cloudflare:workers";
-import { initDatabase, getJobs, createJob } from "@/src/lib/db";
+import { getJobs, createJob } from "@/src/lib/db";
 import { JobInputSchema } from "@/src/schemas/job";
 
 export async function GET(request: Request) {
   try {
     if (!env.DB) return NextResponse.json({ error: "D1 database missing" }, { status: 500 });
-    await initDatabase(env.DB);
 
     const session = await getCurrentUser(request);
     if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -26,7 +25,6 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     if (!env.DB) return NextResponse.json({ error: "D1 database missing" }, { status: 500 });
-    await initDatabase(env.DB);
 
     const session = await getCurrentUser(request);
     if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });

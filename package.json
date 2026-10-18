@@ -40,6 +40,8 @@
 		"test:ticket2": "tsx tests/verify_ticket2.ts",
 		"test:ticket3": "tsx tests/verify_ticket3.ts",
 		"test:ticket4": "tsx tests/verify_ticket4.ts",
-		"test:ticket5": "tsx tests/verify_ticket5.ts"
+		"test:ticket5": "tsx tests/verify_ticket5.ts",
+		"test:remediation": "tsx tests/verify_remediation.ts",
+		"test:all": "npm run test:ticket1 && npm run test:ticket2 && npm run test:ticket3 && npm run test:ticket4 && npm run test:ticket5 && npm run test:remediation"
 	}
 }

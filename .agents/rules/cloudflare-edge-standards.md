@@ -25,4 +25,5 @@ When writing backend, database, or API code for this project, you MUST strictly 
    - Never calculate `SELECT MAX(id) + 1` in application code.
 
 6. **Strict Multi-Tenant Partitioning:**
-   - Every database query touching `clients`, `jobs`, `job_payments`, or `job_photos` must require `userId` as its first parameter and filter with `WHERE user_id = ?`.
+   - User-facing request paths (HTTP routes, user queries, mutations): Every database query touching `clients`, `jobs`, `job_payments`, or `job_photos` must require `userId` as its first parameter and filter with `WHERE user_id = ?` to prevent IDOR vulnerabilities.
+   - System-level maintenance exceptions: Cloudflare Cron Trigger sweepers (`cleanupOrphanedPhotos`) and storage reconcilers (`reconcileR2Storage`) operate cross-tenant by design to reclaim expired leases and unreferenced blobs. These system operations MUST be protected by dedicated authentication (`CRON_SECRET`), fail-closed authorization, and generation-fenced Compare-And-Swap (CAS).

@@ -1,8 +1,11 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/src/lib/auth";
 import { env } from "cloudflare:workers";
-import { initDatabase, getJobPhotoById, deleteJobPhoto } from "@/src/lib/db";
-import { getPhoto, deletePhoto } from "@/src/lib/storage";
+import {
+  getJobPhotoById,
+  handlePhotoDeletionRequest,
+} from "@/src/lib/db";
+import { getPhoto } from "@/src/lib/storage";
 
 export async function GET(
   request: Request,
@@ -10,7 +13,6 @@ export async function GET(
 ) {
   try {
     if (!env.DB) return new Response("D1 database missing", { status: 500 });
-    await initDatabase(env.DB);
 
     const session = await getCurrentUser(request);
     if (!session) return new Response("Unauthorized", { status: 401 });
@@ -23,9 +25,9 @@ export async function GET(
       return new Response("Invalid ID parameters", { status: 400 });
     }
 
-    // Strictly enforce tenant ownership (WHERE id = photoId AND job_id = jobId AND user_id = session.userId)
+    // SEC-02: Strictly enforce tenant ownership
     const photo = await getJobPhotoById(env.DB, jobId, photoId, session.userId);
-    if (!photo) {
+    if (!photo || photo.status !== "ACTIVE") {
       return new Response("Photo not found", { status: 404 });
     }
 
@@ -41,6 +43,8 @@ export async function GET(
       headers: {
         "Content-Type": item.contentType,
         "Cache-Control": "private, max-age=31536000, immutable",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'",
       },
     });
   } catch (error: any) {
@@ -54,7 +58,6 @@ export async function DELETE(
 ) {
   try {
     if (!env.DB) return NextResponse.json({ error: "D1 database missing" }, { status: 500 });
-    await initDatabase(env.DB);
 
     const session = await getCurrentUser(request);
     if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -67,15 +70,10 @@ export async function DELETE(
       return NextResponse.json({ error: "Invalid ID parameters" }, { status: 400 });
     }
 
-    // 1. Delete from D1 (Strictly scoped to session.userId)
-    const deletedPhoto = await deleteJobPhoto(env.DB, session.userId, jobId, photoId);
-
-    // 2. Delete from R2 Storage
     const r2Binding = (env as any).PHOTOS || (env as any).R2;
-    await deletePhoto(r2Binding, deletedPhoto.r2_key);
-
-    return NextResponse.json({ success: true, deletedPhotoId: photoId });
+    const result = await handlePhotoDeletionRequest(env.DB, r2Binding, session.userId, jobId, photoId);
+    return NextResponse.json(result.body, { status: result.status });
   } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 400 });
+    return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }

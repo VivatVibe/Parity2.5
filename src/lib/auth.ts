@@ -10,9 +10,9 @@ export interface SessionPayload {
 
 const COOKIE_NAME = "parity_session";
 
-function getJwtSecret(): Uint8Array {
+export function getJwtSecret(): Uint8Array {
   const secret = process.env.JWT_SECRET;
-  if (!secret) {
+  if (!secret || secret.trim().length === 0) {
     if (process.env.NODE_ENV === "production") {
       throw new Error("JWT_SECRET environment variable is strictly required in production");
     }
@@ -44,11 +44,22 @@ export async function verifySessionToken(token: string): Promise<SessionPayload 
   try {
     const secret = getJwtSecret();
     const { payload } = await jwtVerify(token, secret);
+
+    // Validate claims strictly before trusting them
+    const userId = Number(payload.userId);
+    const email = typeof payload.email === "string" ? payload.email.trim() : "";
+    const name = typeof payload.name === "string" ? payload.name.trim() : "";
+    const avatarUrl = typeof payload.avatarUrl === "string" ? payload.avatarUrl : undefined;
+
+    if (!userId || isNaN(userId) || userId <= 0 || !email || !name) {
+      return null;
+    }
+
     return {
-      userId: payload.userId as number,
-      email: payload.email as string,
-      name: payload.name as string,
-      avatarUrl: payload.avatarUrl as string | undefined,
+      userId,
+      email,
+      name,
+      avatarUrl,
     };
   } catch (error) {
     return null;
@@ -70,7 +81,7 @@ export function getSessionCookie(request: Request): string | null {
   return cookies[COOKIE_NAME] || null;
 }
 
-// 4. Resolve Current User (With MOCK_AUTH bypass support)
+// 4. Resolve Current User (Strict Production Security: Zero Mock Bypass in Prod)
 export async function getCurrentUser(request: Request): Promise<SessionPayload | null> {
   // Check session cookie first
   const token = getSessionCookie(request);
@@ -79,9 +90,14 @@ export async function getCurrentUser(request: Request): Promise<SessionPayload |
     if (session) return session;
   }
 
-  // Local Dev Mock Auth Bypass
-  const isMockAuth = process.env.MOCK_AUTH === "true" || process.env.NODE_ENV !== "production";
-  if (isMockAuth) {
+  // SEC-01: In production, mock authentication is strictly forbidden!
+  // Production deployments MUST NEVER accept MOCK_AUTH=true.
+  if (process.env.NODE_ENV === "production") {
+    return null;
+  }
+
+  // Safe local dev / test mock bypass: ONLY active when MOCK_AUTH === "true" in non-production.
+  if (process.env.MOCK_AUTH === "true") {
     return {
       userId: 1,
       email: "vivat@parity.local",
@@ -93,7 +109,7 @@ export async function getCurrentUser(request: Request): Promise<SessionPayload |
   return null;
 }
 
-// 5. Helper to create Set-Cookie header string
+// 5. Helper to create Set-Cookie header strings
 export function createSessionCookieHeader(token: string): string {
   const isProd = process.env.NODE_ENV === "production";
   return `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${

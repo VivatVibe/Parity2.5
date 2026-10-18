@@ -1,5 +1,5 @@
 import { getGoogleOAuthClient, createSessionToken, createSessionCookieHeader } from "@/src/lib/auth";
-import { getOrCreateUser, initDatabase } from "@/src/lib/db";
+import { getOrCreateUser } from "@/src/lib/db";
 import { env } from "cloudflare:workers";
 import { NextResponse } from "next/server";
 
@@ -25,6 +25,10 @@ export async function GET(request: Request) {
   }
 
   try {
+    if (!env.DB) {
+      return NextResponse.json({ error: "D1 database connection unavailable" }, { status: 500 });
+    }
+
     const google = getGoogleOAuthClient();
     const tokens = await google.validateAuthorizationCode(code, codeVerifier);
     const accessToken = tokens.accessToken();
@@ -44,28 +48,29 @@ export async function GET(request: Request) {
       throw new Error("No email returned from Google");
     }
 
-    // Ensure database is initialized & upsert user
-    if (env.DB) {
-      await initDatabase(env.DB);
-    }
-
-    let userId = 1;
-    if (env.DB) {
-      const user = await getOrCreateUser(env.DB, profile.email, profile.name || profile.email, profile.picture);
-      userId = user.id;
-    }
+    // Fail closed: User must be stored in D1
+    const user = await getOrCreateUser(env.DB, profile.email, profile.name || profile.email, profile.picture);
 
     // Create Session Token
     const sessionToken = await createSessionToken({
-      userId,
+      userId: user.id,
       email: profile.email,
       name: profile.name || profile.email,
       avatarUrl: profile.picture,
     });
 
-    // Redirect to home with session cookie
+    // Redirect to home with session cookie and clear one-time OAuth state cookies
     const response = NextResponse.redirect(new URL("/", request.url));
+    const isProd = process.env.NODE_ENV === "production";
     response.headers.append("Set-Cookie", createSessionCookieHeader(sessionToken));
+    response.headers.append(
+      "Set-Cookie",
+      `google_oauth_state=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${isProd ? "; Secure" : ""}`
+    );
+    response.headers.append(
+      "Set-Cookie",
+      `google_code_verifier=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${isProd ? "; Secure" : ""}`
+    );
 
     return response;
   } catch (error: any) {

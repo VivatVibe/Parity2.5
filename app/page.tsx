@@ -3,6 +3,7 @@
 import { useEffect, useState, useTransition } from "react";
 import Link from "next/link";
 import type { DashboardData, DashboardJobItem } from "@/src/lib/db";
+import { executePaymentWithRetry } from "@/src/lib/payment-client";
 
 export default function MissionControlDashboard() {
   const [data, setData] = useState<DashboardData | null>(null);
@@ -60,24 +61,29 @@ export default function MissionControlDashboard() {
   const handleCollectRetainer = async (job: DashboardJobItem) => {
     const monthlyRate = Number(job.parsedMetadata?.monthlyRate) || job.total_quoted_amount;
     const period = job.currentCyclePeriod || "";
-    if (!confirm(`บันทึกรับเงินรอบบิล ${period} จำนวน ฿${monthlyRate.toLocaleString()} สำหรับ ${job.client.name}?`)) {
+    const amountToCollect = job.balanceDue > 0 ? job.balanceDue : monthlyRate;
+    if (!confirm(`บันทึกรับเงินรอบบิล ${period} จำนวน ฿${amountToCollect.toLocaleString()} สำหรับ ${job.client.name}?`)) {
       return;
     }
 
     try {
       setCollectingRetainerId(job.id);
-      const res = await fetch(`/api/jobs/${job.id}/payments`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          amount: monthlyRate,
-          parts_cost: 0,
-          payment_type: "RETAINER_CYCLE",
-          billing_period: period,
-          note: "1-Click Collect from Dashboard",
-        }),
+      const storage = typeof window !== "undefined" ? window.localStorage : null;
+      const result = await executePaymentWithRetry({
+        jobId: job.id,
+        amount: amountToCollect,
+        partsCost: 0,
+        paymentType: "RETAINER_CYCLE",
+        billingPeriod: period,
+        note: "1-Click Collect from Dashboard",
+        storage,
+        fetchFn: fetch,
       });
-      if (!res.ok) throw new Error("Failed to record retainer payment");
+
+      if (!result.ok) {
+        throw new Error(result.error || "Failed to record retainer payment");
+      }
+
       await fetchDashboard(searchQuery);
     } catch (err: any) {
       alert("Error: " + err.message);
@@ -175,11 +181,12 @@ export default function MissionControlDashboard() {
 
           <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm space-y-1">
             <span className="text-[11px] font-semibold text-blue-700 block uppercase tracking-wider">
-              📈 กำไรสุทธิเดือนนี้ (Net Profit)
+              📈 กำไรเบื้องต้นเดือนนี้ (Contribution Margin)
             </span>
             <p className="text-2xl font-black text-blue-700 font-mono">
               ฿{data?.kpis.monthlyProfit?.toLocaleString() ?? 0}
             </p>
+            <p className="text-[10px] text-slate-400">รายรับหักต้นทุนอะไหล่ (ก่อนหักค่าโสหุ้ย)</p>
           </div>
 
           <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm space-y-1">

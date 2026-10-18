@@ -51,8 +51,8 @@ CREATE TABLE IF NOT EXISTS job_payments (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  amount REAL NOT NULL,
-  parts_cost REAL DEFAULT 0, -- Hardware parts cost for net profit calculation
+  amount REAL NOT NULL CHECK(amount > 0),
+  parts_cost REAL DEFAULT 0 CHECK(parts_cost >= 0), -- Hardware parts cost for net profit calculation
   payment_type TEXT NOT NULL, -- 'DEPOSIT', 'MILESTONE', 'FINAL', 'RETAINER_CYCLE'
   billing_period TEXT, -- 'YYYY-MM' e.g. '2026-10' for recurring retainers
   paid_at DATETIME DEFAULT CURRENT_TIMESTAMP,
