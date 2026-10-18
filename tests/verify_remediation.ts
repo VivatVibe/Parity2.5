@@ -71,6 +71,8 @@ function createInstrumentedMockD1(): {
   resetQueryCount: () => void;
 } {
   const sqlite = new DatabaseSync(":memory:");
+  // ponytail: D1 enforces FK by default; SQLite doesn't. Match production behavior.
+  sqlite.exec("PRAGMA foreign_keys = ON");
   let queryCount = 0;
 
   const db = {
@@ -1922,19 +1924,17 @@ async function runRemediationVerification() {
   );
 
   // No tombstone should exist (FK violation prevented INSERT), but this must not crash
+  // With PRAGMA foreign_keys = ON (matching D1 production), tombstone INSERT must fail
+  // because job 999888 doesn't exist — FK constraint on job_id REFERENCES jobs(id)
   const noParentTombstone = sqlite.prepare("SELECT id FROM job_photos WHERE r2_key = ?").get(orphanKeyNoParent);
-  // If FK is enforced, tombstone won't exist; if FK is not enforced, tombstone may exist — both are acceptable
-  // The key assertion: R2 reconciler will catch this orphan after grace period
+  assert.strictEqual(noParentTombstone, undefined, "Tombstone must NOT exist when parent job is missing (FK enforced)");
+  // The key assertion: R2 reconciler is the last-resort cleanup for this orphan
   const reconcileNoParent = await reconcileR2Storage(null, db, {
     prefix: `users/${user1.id}/jobs/999888/`,
     safetyGracePeriodMs: 0,
   });
   assert.ok(reconcileNoParent.deletedOrphans.includes(orphanKeyNoParent), "R2 reconciler catches orphan when tombstone INSERT failed");
   assert.strictEqual(await getPhoto(null, orphanKeyNoParent), null, "Orphan R2 object cleaned up by reconciler");
-  // Clean up tombstone if it was created
-  if (noParentTombstone) {
-    sqlite.prepare("DELETE FROM job_photos WHERE r2_key = ?").run(orphanKeyNoParent);
-  }
 
   console.log("  ✓ Scenario 7: Unified deletion ownership, lease-aware CAS, generation-fenced diagnostics, tombstone recovery, and production 60m clamping verified");
 
