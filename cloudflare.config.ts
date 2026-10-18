@@ -2,7 +2,7 @@ import { bindings, defineConfig, defineWorker } from "cf/config";
 
 export default defineConfig({
   worker: defineWorker({
-    name: "parity-app",
+    name: process.env.WORKER_NAME || "parity-app",
     entrypoint: "src/worker.ts",
     compatibilityDate: "2026-10-17",
     compatibilityFlags: ["nodejs_compat"],
@@ -16,7 +16,7 @@ export default defineConfig({
         name: "parity-db",
         ...(process.env.D1_DATABASE_ID ? { id: process.env.D1_DATABASE_ID } : {}),
       }),
-      PHOTOS: bindings.r2({ name: "parity-photos" }),
+      PHOTOS: bindings.r2({ name: process.env.R2_BUCKET_NAME || "parity-photos" }),
     },
   }),
 });

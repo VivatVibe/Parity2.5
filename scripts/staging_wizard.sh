@@ -271,8 +271,18 @@ stage "Deploy & Staging Smoke Tests"
 say "Deploying application to staging and recording audit trail."
 step "Build and deploy to staging worker..."
 if confirm "Deploy worker to staging now?"; then
-  npm run build
-  npx wrangler deploy --name parity-app-staging
+  export WORKER_NAME="parity-app-staging"
+  export D1_DATABASE_ID="${D1_DATABASE_ID}"
+  export R2_BUCKET_NAME="${R2_BUCKET_NAME:-parity-photos-staging}"
+  
+  # Try native Vinext/Cloudflare deploy first; fallback to clean wrangler deploy
+  if npm run deploy; then
+    step "Successfully deployed with native Cloudflare CLI (cf)!"
+  else
+    warn "Native deploy returned non-zero, trying clean wrangler deploy..."
+    rm -rf .cloudflare/output
+    npx wrangler deploy --name parity-app-staging
+  fi
 fi
 
 say "Staging verification test options:"
